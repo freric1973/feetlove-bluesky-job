@@ -9,7 +9,8 @@ Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php 
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
 """
 from __future__ import annotations
-import hashlib, hmac, json, os, re, secrets, sys, time, urllib.error, urllib.parse, urllib.request
+import hashlib, hmac, json, os, re, secrets, sys, threading, time, urllib.error, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor, wait as fwait
 from datetime import datetime, timezone
 
 ENV = os.environ.get
@@ -25,12 +26,37 @@ READONLY = ENV("FL_READONLY", "0") == "1"          # nur lesen: keine Likes, kei
 UF_SCAN_MIN = int(ENV("FL_UF_SCAN_MIN", "240"))     # Follower-Abgleich höchstens alle X Minuten
 MAX_RUNTIME = float(ENV("FL_MAX_RUNTIME", "420"))   # Sicherheitsgrenze je Lauf (Sekunden)
 SLEEP_LIKE = float(ENV("FL_SLEEP_LIKE", "0.7"))
+LIKES_BUDGET = float(ENV("FL_LIKES_BUDGET", "240"))  # Auto-Likes enden spätestens nach X s, wenn der Abgleich fällig ist
+FINISH_RESERVE = float(ENV("FL_FINISH_RESERVE", "25"))  # Rest für Abschluss-Meldung an die Seite
+AI_WORKERS = max(1, int(ENV("FL_AI_WORKERS", "8")))   # gleichzeitige KI-Prüfungen / Thread-Abrufe
+UF_STALE_MIN = int(ENV("FL_UF_STALE_MIN", "720"))   # Abgleich länger als X Min nicht fertig -> echter Fehler
 RUN_ID = ENV("GITHUB_RUN_ID", "local") + "-" + ENV("GITHUB_RUN_ATTEMPT", "1") + "-" + secrets.token_hex(4)
 T0 = time.monotonic()
 
 
+_PHASE_END = [MAX_RUNTIME]   # Ende der aktuellen Phase (Sekunden ab Start)
+
+
+def phase(end_s: float) -> None:
+    _PHASE_END[0] = min(end_s, MAX_RUNTIME)
+
+
 def left() -> float:
+    """Restzeit der aktuellen Phase (nie mehr als die Gesamt-Restzeit)."""
+    el = time.monotonic() - T0
+    return min(MAX_RUNTIME, _PHASE_END[0]) - el
+
+
+def total_left() -> float:
     return MAX_RUNTIME - (time.monotonic() - T0)
+
+
+class Deferred(Exception):
+    """Phase hatte nicht genug Zeit – kein Fehler, nächster Lauf macht weiter."""
+
+
+_AI = {"calls": 0, "retries": 0, "secs": 0.0}
+_AI_LOCK = threading.Lock()
 
 
 class RateLimit(Exception):
@@ -163,7 +189,7 @@ XAI_MODEL = "grok-4.3"
 SYSTEM_PROMPT = ('Du prüfst Antworten auf Social-Media-Posts des Bloggers Dennis. negative=true NUR, wenn die Antwort Dennis PERSÖNLICH beleidigt, beschimpft, verhöhnt, bedroht oder belästigt (Beleidigungen, Schimpfwörter gegen ihn, Hass, abwertende Aussagen über seine Person, sexuelle Belästigung, Drohungen). negative=false für alles andere, insbesondere: Kritik an einem Thema, an Firmen (z. B. Google), Produkten, Politik oder Meinungen; Widerspruch in der Sache; Sarkasmus oder Spott über das Thema; Witze, Wortspiele, Insider, Emojis; kurze oder rätselhafte Antworten (z. B. "Hex, Hex"); Zustimmung, Flirt, Neutrales. Im Zweifel negative=false. reason: max. 8 Wörter, deutsch.')
 
 
-def ai_negative(text: str, parent: str) -> tuple[bool, str]:
+def ai_negative(text: str, parent: str, deadline: float | None = None) -> tuple[bool, str]:
     if not XAI_KEY:
         raise RuntimeError("xAI-Key fehlt")
     schema = {"type": "object", "properties": {"negative": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["negative", "reason"], "additionalProperties": False}
@@ -171,18 +197,39 @@ def ai_negative(text: str, parent: str) -> tuple[bool, str]:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "Ursprungspost (Kontext):\n" + parent[:500] + "\n\nAntwort:\n" + text[:1000]}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "reply_sentiment", "strict": True, "schema": schema}}}
-    req = urllib.request.Request(XAI_BASE + "/v1/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode(),
-                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + XAI_KEY}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=40) as r:
-            d = json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode(errors="replace")
-        if e.code == 403 and "credits" in raw.lower():
-            raise RuntimeError("xAI HTTP 403 (Guthaben/Ausgabelimit erreicht)")
-        raise RuntimeError(f"xAI HTTP {e.code}")
-    except (urllib.error.URLError, TimeoutError, ConnectionError):
-        raise RuntimeError("xAI HTTP 0")
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    t_end = time.monotonic() + (deadline if deadline is not None else 90)
+    d: dict = {}
+    for attempt in range(4):
+        req = urllib.request.Request(XAI_BASE + "/v1/chat/completions", data=body,
+                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + XAI_KEY}, method="POST")
+        t1 = time.monotonic(); wait_s = 0.0
+        try:
+            with urllib.request.urlopen(req, timeout=max(3.0, min(30.0, t_end - t1))) as r:
+                d = json.loads(r.read() or b"{}")
+            break
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode(errors="replace")
+            if e.code == 403 and "credits" in raw.lower():
+                raise RuntimeError("xAI HTTP 403 (Guthaben/Ausgabelimit erreicht)")
+            fail = RuntimeError(f"xAI HTTP {e.code}")
+            if e.code != 429 and e.code < 500:
+                raise fail
+            try:
+                wait_s = float(e.headers.get("Retry-After") or 0)
+            except (TypeError, ValueError):
+                wait_s = 0.0
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            fail = RuntimeError("xAI HTTP 0")
+        finally:
+            with _AI_LOCK:
+                _AI["calls"] += 1; _AI["secs"] += time.monotonic() - t1
+        wait_s = min(max(wait_s, 1.5 * (2 ** attempt)), 20.0)
+        if attempt == 3 or time.monotonic() + wait_s + 5 > t_end:
+            raise fail
+        with _AI_LOCK:
+            _AI["retries"] += 1
+        time.sleep(wait_s)
     ch = (d.get("choices") or [{}])[0]
     try:
         r = json.loads((ch.get("message") or {}).get("content") or "")
@@ -193,14 +240,18 @@ def ai_negative(text: str, parent: str) -> tuple[bool, str]:
     return bool(r["negative"]), str(r.get("reason", "")).strip()[:120]
 
 
-def classify(text: str, parent: str) -> tuple[str, str]:
+def needs_ai(text: str) -> bool:
+    return not is_question(text) and not insult_hit(text)
+
+
+def classify(text: str, parent: str, deadline: float | None = None) -> tuple[str, str]:
     if is_question(text):
         return "review", "Frage"
     w = insult_hit(text)
     if w:
         return "review", f"Beleidigend: „{w}“"
     try:
-        neg, why = ai_negative(text, parent)
+        neg, why = ai_negative(text, parent, deadline)
     except Exception as e:  # noqa: BLE001
         return "review", "KI-Prüfung fehlgeschlagen: " + str(e)
     return ("review", "Persönlich beleidigend (KI): " + why) if neg else ("like", why)
@@ -280,6 +331,9 @@ class AutoLike:
         self.notif_new, self.cache_new = None, None
         self.likes = 0
         self.ops: list = []
+        self.pool = ThreadPoolExecutor(max_workers=AI_WORKERS, thread_name_prefix="fl")
+        self.cls: dict = {}          # Schlüssel -> (Entscheidung, Grund), parallel vorab ermittelt
+        self.t: dict = {}            # Zeitmessung je Schritt
         self.stats = {"ok": True, "dryrun": self.dry, "posts": 0, "seen": 0, "liked": 0, "review": 0, "skipped": 0, "would_like": 0,
                       "notif": 0, "notif_pages": 0, "notif_gone": 0, "errors": []}
 
@@ -310,8 +364,35 @@ class AutoLike:
             return "ALREADY"
         return self.bs.like(uri, cid)
 
+    def prefetch(self, items: list) -> None:
+        """KI-Prüfungen parallel vorab ausführen. items: [(schlüssel, text, kontext)]. Ergebnis identisch zu classify()."""
+        todo = [(k, t, p) for k, t, p in items if k not in self.cls and needs_ai(t)]
+        if not todo or left() < 25:
+            return
+        dl = left() - 10
+        futs = {self.pool.submit(classify, t, p, dl): k for k, t, p in todo}
+        done, _ = fwait(futs, timeout=max(1.0, left() - 8))
+        for f in done:
+            self.cls[futs[f]] = f.result()
+
+    def classify_c(self, key: str, text: str, parent: str):
+        r = self.cls.pop(key, None)
+        if r is not None:
+            return r
+        if needs_ai(text) and left() < 20:
+            return None                      # keine Zeit mehr für die KI -> nächster Lauf
+        return classify(text, parent, max(5.0, left() - 5))
+
+    @staticmethod
+    def needs_check(c: dict, prev, flagged: dict, dry: bool) -> bool:
+        return not c["liked"] and not flagged.get(c["did"]) and not c["muted"] and not (prev == "dryrun" and not dry)
+
     def decide(self, c: dict, prev) -> str:
         s = self.stats
+        if self.needs_check(c, prev, self.flagged, self.dry):
+            r = self.classify_c(c["uri"], c["text"], c["root_text"])
+            if r is None:
+                s["time_limit"] = True; return "time"
         s["seen"] += 1
         if c["liked"]:
             self.save(c, "skipped", "bereits geliked", c["like_uri"]); s["skipped"] += 1; return "ok"
@@ -322,7 +403,7 @@ class AutoLike:
         if prev == "dryrun" and not self.dry:
             dec, why = "like", "aus Testmodus übernommen"
         else:
-            dec, why = classify(c["text"], c["root_text"])
+            dec, why = r
         if dec == "review":
             self.save(c, "review", why); s["review"] += 1; return "ok"
         if self.dry:
@@ -365,11 +446,15 @@ class AutoLike:
             self.known[uri] = "liked"; self.stats["liked"] += 1; self.likes += 1; time.sleep(SLEEP_LIKE)
 
     def step_ki_rows(self) -> None:
+        self.prefetch([("ki:" + str(r["id"]), str(r.get("text") or ""), str(r.get("parent_text") or "")) for r in self.ki_rows])
         for row in self.ki_rows:
             if left() < 30:
                 self.stats["time_limit"] = True; break
             rid, uri, cid = int(row["id"]), str(row["reply_uri"]), str(row["reply_cid"])
-            dec, why = classify(str(row.get("text") or ""), str(row.get("parent_text") or ""))
+            r = self.classify_c("ki:" + str(rid), str(row.get("text") or ""), str(row.get("parent_text") or ""))
+            if r is None:
+                self.stats["time_limit"] = True; break
+            dec, why = r
             if dec == "review" and why.startswith("KI-Prüfung fehlgeschlagen"):
                 self.err(why); break
             if dec == "review":
@@ -462,25 +547,35 @@ class AutoLike:
                     raise
                 except Exception as e:  # noqa: BLE001
                     self.err(str(e)); break
+                built: dict = {}
                 for u in chunk:
                     p = posts.get(u)
                     if p is None:
-                        s["notif_gone"] += 1; queue.pop(0); continue
+                        built[u] = None; continue
                     a, rec = p.get("author") or {}, p.get("record") or {}
                     anchor = own_anchor(rec, me, own_cutoff)
                     created = str(rec.get("createdAt") or p.get("indexedAt") or "")
                     if a.get("did") == me or not anchor or ts(created) < self.since or not self.want(u):
-                        queue.pop(0); continue
+                        built[u] = False; continue
                     par = ctx.get(str(((rec.get("reply") or {}).get("parent") or {}).get("uri", "")), {})
                     anc = ctx.get(anchor, {})
-                    c = {"uri": u, "cid": str(p.get("cid", "")), "did": str(a.get("did", "")), "handle": str(a.get("handle", "")),
+                    built[u] = {"uri": u, "cid": str(p.get("cid", "")), "did": str(a.get("did", "")), "handle": str(a.get("handle", "")),
                          "text": str(rec.get("text", "")), "created": created,
                          "liked": bool((p.get("viewer") or {}).get("like")), "like_uri": str((p.get("viewer") or {}).get("like", "")),
                          "muted": muted(a), "root_uri": anchor, "root_text": str((anc.get("record") or {}).get("text", "")),
                          "avatar": str(a.get("avatar", "")),
                          "thumb": embed_thumb(p.get("embed")) or embed_thumb(par.get("embed")) or embed_thumb(anc.get("embed")),
                          "parent_text": str((par.get("record") or {}).get("text", ""))[:500]}
-                    if self.decide(c, self.known.get(u)) == "limit":
+                if self.likes < self.st["max"] or self.dry:
+                    self.prefetch([(c["uri"], c["text"], c["root_text"]) for u2, c in built.items()
+                                   if c and self.needs_check(c, self.known.get(u2), self.flagged, self.dry)])
+                for u in chunk:
+                    c = built[u]
+                    if c is None:
+                        s["notif_gone"] += 1; queue.pop(0); continue
+                    if c is False or not self.want(u):
+                        queue.pop(0); continue
+                    if self.decide(c, self.known.get(u)) in ("limit", "time"):
                         raise StopIteration
                     queue.pop(0)
         except StopIteration:
@@ -534,6 +629,19 @@ class AutoLike:
         s["fallback"] = "gelaufen"
         posts = self.own_posts(); mine = {p.get("uri") for p in posts}
         cache, new_cache, cur = self.cache_old, {}, ""
+        def fetch(u: str):
+            try:
+                return self.bs.get("app.bsky.feed.getPostThread", {"uri": u, "depth": 10, "parentHeight": 0})
+            except Exception as e:  # noqa: BLE001  (RateLimit eingeschlossen; wird unten in Reihenfolge behandelt)
+                return e
+        need = []
+        for p in posts:
+            rc, uri = int(p.get("replyCount") or 0), str(p.get("uri", ""))
+            root = str((((p.get("record") or {}).get("reply") or {}).get("root") or {}).get("uri", ""))
+            cv = cache.get(uri)
+            if rc and not (root and root in mine) and not (cv and int(cv[0]) == rc and time.time() - int(cv[1]) <= 10800):
+                need.append(uri)
+        futs = {u: self.pool.submit(fetch, u) for u in need} if left() >= 30 else {}
         try:
             for p in posts:
                 rc, uri = int(p.get("replyCount") or 0), str(p.get("uri", ""))
@@ -546,18 +654,25 @@ class AutoLike:
                 cv = cache.get(uri)
                 if cv and int(cv[0]) == rc and time.time() - int(cv[1]) <= 10800:
                     new_cache[uri] = cv; continue
-                if left() < 30:
+                if left() < 30 or uri not in futs:
                     s["time_limit"] = True; break
                 s["posts"] += 1
                 try:
-                    th = self.bs.get("app.bsky.feed.getPostThread", {"uri": uri, "depth": 10, "parentHeight": 0})
-                except RateLimit:
-                    raise
-                except Exception as e:  # noqa: BLE001
-                    self.err(str(e)); continue
+                    th = futs[uri].result(timeout=max(1.0, left() - 20))
+                except Exception:  # noqa: BLE001  (Zeitüberschreitung beim Warten)
+                    s["time_limit"] = True; break
+                if isinstance(th, RateLimit):
+                    raise th
+                if isinstance(th, Exception):
+                    self.err(str(th)); continue
                 new_cache[uri] = [rc, int(time.time())]
                 lst: list = []
                 self.collect(th.get("thread") or {}, str((p.get("record") or {}).get("text", "")), lst)
+                if self.likes < self.st["max"] or self.dry:
+                    self.prefetch([(c["uri"], c["text"], c["root_text"]) for c in lst
+                                   if c["uri"] and c["did"] != self.me and ts(c["created"]) >= self.since
+                                   and (self.known.get(c["uri"]) is None or (self.known.get(c["uri"]) == "dryrun" and not self.dry))
+                                   and self.needs_check(c, self.known.get(c["uri"]), self.flagged, self.dry)])
                 for c in lst:
                     if not c["uri"] or c["did"] == self.me:
                         continue
@@ -568,9 +683,8 @@ class AutoLike:
                         continue
                     if left() < 20:
                         s["time_limit"] = True; new_cache.pop(uri, None); raise StopIteration
-                    if self.decide(c, prev) == "limit":
+                    if self.decide(c, prev) in ("limit", "time"):
                         new_cache.pop(uri, None); raise StopIteration
-                time.sleep(0.2)
         except StopIteration:
             pass
         if not s.get("time_limit") and not s.get("limit_reached"):
@@ -580,15 +694,19 @@ class AutoLike:
 
     def run(self) -> dict:
         try:
-            self.step_dryrun_rows()
-            self.step_ki_rows()
-            self.step_notif()
-            self.step_threads()
+            for name, fn in (("testmodus", self.step_dryrun_rows), ("ki_nachpruefung", self.step_ki_rows),
+                             ("mitteilungen", self.step_notif), ("threads", self.step_threads)):
+                t1 = time.monotonic()
+                try:
+                    fn()
+                finally:
+                    self.t[name] = round(time.monotonic() - t1, 1)
         except RateLimit:
             self.stats["ok"] = False; self.stats["errors"].append("Bluesky-Rate-Limit erreicht – nächster Lauf macht weiter")
         except Exception as e:  # noqa: BLE001
             self.stats["ok"] = False; self.stats["errors"].append(str(e)[:300])
         finally:
+            self.pool.shutdown(wait=False, cancel_futures=True)
             self.flush()
         return self.stats
 
@@ -609,15 +727,21 @@ def account_status(did: str) -> str:
 _DID = re.compile(r"^did:[a-z0-9]+:[A-Za-z0-9._:%-]+$")
 
 
+UF_INFO: dict = {}
+
+
 def uf_scan(bs: Bsky) -> list:
+    """Kompletter Follower-Abruf (100 je Seite, keine Einzelabrufe). Reicht die Zeit nicht: Deferred (kein Fehler)."""
     members, cursor, seen = {}, "", set()
+    t1 = time.monotonic(); UF_INFO.update(pages=0, fetch_s=0.0)
     for _ in range(1000):
-        if left() < 60:
-            raise TimeoutError("Laufzeitgrenze vor Ende des Follower-Abrufs")
+        UF_INFO["fetch_s"] = round(time.monotonic() - t1, 1); UF_INFO["fetched"] = len(members)
+        if left() < 45:   # Rest wird für das Speichern der Liste (~2 MB) gebraucht
+            raise Deferred("Zeit reichte nicht für den kompletten Follower-Abruf – nächster Lauf macht ihn")
         q = {"actor": bs.did, "limit": 100}
         if cursor:
             q["cursor"] = cursor
-        d = bs.get("app.bsky.graph.getFollowers", q)
+        d = bs.get("app.bsky.graph.getFollowers", q); UF_INFO["pages"] += 1
         if (d.get("subject") or {}).get("did") != bs.did or not isinstance(d.get("followers"), list):
             raise RuntimeError("Unvollständige Follower-Antwort; Vergleich nicht übernommen.")
         for p in d["followers"]:
@@ -628,6 +752,7 @@ def uf_scan(bs: Bsky) -> list:
         if not isinstance(cursor, str):
             raise RuntimeError("Ungültiger Follower-Cursor.")
         if not cursor:
+            UF_INFO["fetch_s"] = round(time.monotonic() - t1, 1); UF_INFO["fetched"] = len(members)
             return list(members.values())
         if cursor in seen:
             raise RuntimeError("Wiederholter Follower-Cursor; Vergleich abgebrochen.")
@@ -645,11 +770,19 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
     last = uf.get("last_completed") or ""
     age = time.time() - ts(last.replace(" ", "T") + "+00:00") if last else 1e9
     if age >= UF_SCAN_MIN * 60:
-        members = uf_scan(bs)
-        res["followers"] = len(members)
+        try:
+            members = uf_scan(bs)
+        except Deferred as e:
+            res.update(status="deferred", message=str(e), **UF_INFO)
+            if last and age >= UF_STALE_MIN * 60:   # zu lange nicht fertig geworden -> echter Fehler (alter Cron übernimmt)
+                res.update(status="error", message=f"Follower-Abgleich seit {int(age // 3600)} h nicht fertig geworden")
+            return res
+        res["followers"] = len(members); res.update(UF_INFO)
         if READONLY:
             res["status"] = "readonly_scan"; return res
+        t1 = time.monotonic()
         r = bridge("uf_commit", actor=bs.did, members=members)
+        res["commit_s"] = round(time.monotonic() - t1, 1)
         res.update({k: r.get(k) for k in ("status", "new", "reason")})
         if r.get("status") not in ("baseline", "complete"):
             return res
@@ -721,19 +854,42 @@ def main() -> int:
     XAI_MODEL = st.get("xai_model") or XAI_MODEL
     al_stats: dict = {"ok": True, "status": "disabled", "errors": []}; uf_res: dict = {"status": "skipped"}
     al = None; ran = False
+    timing: dict = {}
+    uf = st.get("uf") or {}
+    last = uf.get("last_completed") or ""
+    uf_age = time.time() - ts(last.replace(" ", "T") + "+00:00") if last else 1e9
+    uf_due = bool(uf.get("ready") and uf.get("enabled") and uf_age >= UF_SCAN_MIN * 60)
+    uf_first = uf_due and uf_age >= 2 * UF_SCAN_MIN * 60     # deutlich überfällig -> Abgleich vor den Likes
+    end_all = MAX_RUNTIME - FINISH_RESERVE
+
+    def do_uf() -> dict:
+        t1 = time.monotonic()
+        try:
+            return uf_run(bs, uf)
+        except Exception as e:  # noqa: BLE001
+            return {"status": "error", "message": str(e)[:200]}
+        finally:
+            timing["entfolger"] = round(time.monotonic() - t1, 1)
     try:
         bs = Bsky()
+        if uf_first:
+            phase(end_all - 90)          # mind. 90 s bleiben für die Likes
+            uf_res = do_uf()
         if st["settings"].get("enabled"):
+            phase(min(LIKES_BUDGET, end_all) if (uf_due and not uf_first) else end_all)
+            t1 = time.monotonic()
             al = AutoLike(bs, st); al_stats = al.run(); ran = True
-        try:
-            uf_res = uf_run(bs, st.get("uf") or {})
-        except Exception as e:  # noqa: BLE001
-            uf_res = {"status": "error", "message": str(e)[:200]}
+            timing["auto_likes"] = round(time.monotonic() - t1, 1); timing["auto_likes_schritte"] = al.t
+        if not uf_first:
+            phase(end_all)
+            uf_res = do_uf()
     except Exception as e:  # noqa: BLE001
         al_stats = {"ok": False, "status": "error", "errors": [str(e)[:300]]}
     finally:
         clean = bool(al_stats.get("ok", True)) and not al_stats.get("errors") and uf_res.get("status") != "error"
-        fin = {"stats": al_stats, "autolike_ran": ran and not READONLY, "uf": uf_res, "clean": clean and not READONLY}
+        # "deferred" meldet die Seite als in_progress -> alter Cron sieht den Abgleich weiter als fällig an
+        uf_site = dict(uf_res, status="in_progress") if uf_res.get("status") == "deferred" else uf_res
+        fin = {"stats": al_stats, "autolike_ran": ran and not READONLY, "uf": uf_site, "clean": clean and not READONLY}
         if al and al.notif_new is not None and not READONLY:
             fin["notif"] = al.notif_new
         if al and al.cache_new is not None and not READONLY:
@@ -744,6 +900,9 @@ def main() -> int:
     if al_stats.get("errors"):
         log("Hinweise: " + "; ".join(al_stats["errors"]))
     log("Entfolger: " + json.dumps({k: v for k, v in uf_res.items() if k != "pending"}, ensure_ascii=False))
+    if _AI["calls"]:
+        log(f"KI: {_AI['calls']} Aufrufe, Ø {_AI['secs'] / _AI['calls']:.1f} s, {_AI['retries']} Wiederholungen, {AI_WORKERS} parallel")
+    log("Zeiten (s): " + json.dumps(timing, ensure_ascii=False) + (" | Abgleich zuerst" if uf_first else ""))
     log(f"Dauer {time.monotonic() - T0:.1f} s")
     return 0 if clean else 1
 
