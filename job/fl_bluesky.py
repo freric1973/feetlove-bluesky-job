@@ -796,7 +796,7 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
         res["status"] = "not_due"; res["last_run_min"] = int(age // 60)
     if not pending or READONLY:
         res["pending"] = len(pending); return res
-    count = errors = 0; stopped = ""
+    count = errors = blocked = 0; stopped = ""
     for row in pending[:10]:
         if left() < 30:
             stopped = "Laufzeitgrenze"; break
@@ -812,7 +812,13 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
                 raise RuntimeError("Profilbeziehung nicht sicher prüfbar.")
             v = p["viewer"]
             if v.get("blocking") or v.get("blockedBy") or v.get("blockingByList"):
-                raise RuntimeError("Blockierte Beziehung nicht als normales Entfolgen gewertet.")
+                # Blockierung ist kein Fehler: nur notieren und überspringen (bleibt auf der Website zur Ansicht markiert)
+                blocked += 1; log("Entfolgen-Prüfung: blockierte Beziehung übersprungen (kein Fehler).")
+                try:
+                    bridge("uf_event", type="error", **base)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             base.update(handle=str(p.get("handle") or base["handle"]), display_name=str(p.get("displayName") or base["display_name"]))
             if v.get("followedBy"):
                 bridge("uf_event", type="returned", **base); continue
@@ -839,7 +845,7 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
             except Exception:  # noqa: BLE001
                 pass
         time.sleep(0.15)
-    res["automatic"] = {"unfollowed": count, "error_count": errors, "stopped": stopped}
+    res["automatic"] = {"unfollowed": count, "error_count": errors, "blocked_skipped": blocked, "stopped": stopped}
     if errors:
         res["status"] = "error"
     return res
