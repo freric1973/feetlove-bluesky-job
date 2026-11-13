@@ -3,7 +3,7 @@ name: Bluesky Auto-Likes + Entfolger
 on:
   schedule:
     # alle 30 Minuten, bewusst nicht zur vollen Stunde (GitHub verzögert dort oft). Zeiten in UTC.
-    - cron: "11,41 * * * *"
+    - cron: "13,43 * * * *"
   workflow_dispatch:
     inputs:
       readonly:
