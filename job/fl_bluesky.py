@@ -69,6 +69,9 @@ def log(msg: str) -> None:
 
 # ---------------- HTTP ----------------
 
+TRANSIENT_PREFIX = "Bluesky kurz gestört: "   # 5xx/Netz: nur Hinweis, kein Fehler (nächster Lauf holt es nach)
+
+
 def http(url: str, headers: dict | None = None, body: bytes | None = None, timeout: float = 30, retries: int = 2) -> dict:
     last = None
     for attempt in range(retries + 1):
@@ -87,11 +90,11 @@ def http(url: str, headers: dict | None = None, body: bytes | None = None, timeo
             if e.code == 429:
                 raise RateLimit()
             msg = str(d.get("message") or d.get("error") or f"HTTP {e.code}") if isinstance(d, dict) else f"HTTP {e.code}"
-            last = RuntimeError(msg)
+            last = RuntimeError(f"{TRANSIENT_PREFIX}{msg} (HTTP {e.code})" if e.code >= 500 else msg)
             if e.code < 500 or body is not None:   # Schreibaufrufe nie automatisch wiederholen
                 raise last
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            last = RuntimeError("Bluesky nicht erreichbar.")
+            last = RuntimeError(TRANSIENT_PREFIX + "Bluesky nicht erreichbar.")
             if body is not None:
                 raise last
         time.sleep(1.5 * (attempt + 1))
@@ -355,6 +358,12 @@ class AutoLike:
 
     def err(self, msg: str) -> None:
         s = self.stats
+        if msg.startswith(TRANSIENT_PREFIX):
+            s["hint_count"] = s.get("hint_count", 0) + 1
+            h = s.setdefault("hints", [])
+            if len(h) < 5 and msg not in h:
+                h.append(msg)
+            return
         s["error_count"] = s.get("error_count", 0) + 1
         if len(s["errors"]) < 5 and msg not in s["errors"]:
             s["errors"].append(msg)
@@ -906,10 +915,12 @@ def main() -> int:
         if al and al.cache_new is not None and not READONLY:
             fin["thread_cache"] = al.cache_new
         bridge("finish", **fin)
-    summary = {k: v for k, v in al_stats.items() if k != "errors"}
+    summary = {k: v for k, v in al_stats.items() if k not in ("errors", "hints")}
     log("Auto-Likes: " + json.dumps(summary, ensure_ascii=False))
     if al_stats.get("errors"):
-        log("Hinweise: " + "; ".join(al_stats["errors"]))
+        log("Fehler: " + "; ".join(al_stats["errors"]))
+    if al_stats.get("hints"):
+        log("Hinweise (kein Fehler): " + "; ".join(al_stats["hints"]))
     log("Entfolger: " + json.dumps({k: v for k, v in uf_res.items() if k != "pending"}, ensure_ascii=False))
     if _AI["calls"]:
         log(f"KI: {_AI['calls']} Aufrufe, Ø {_AI['secs'] / _AI['calls']:.1f} s, {_AI['retries']} Wiederholungen, {AI_WORKERS} parallel")
