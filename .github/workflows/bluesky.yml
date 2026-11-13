@@ -1,0 +1,38 @@
+name: Bluesky Auto-Likes + Entfolger
+
+on:
+  schedule:
+    # alle 30 Minuten, bewusst nicht zur vollen Stunde (GitHub verzögert dort oft). Zeiten in UTC.
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+    inputs:
+      readonly:
+        description: "Nur lesen (keine Likes, kein Entfolgen, nichts speichern)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bluesky-job
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Job ausführen
+        env:
+          FL_BRIDGE_URL: ${{ secrets.FL_BRIDGE_URL }}
+          FL_BRIDGE_SECRET: ${{ secrets.FL_BRIDGE_SECRET }}
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          # Planläufe: normal. Handstart: standardmäßig nur lesen.
+          FL_READONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.readonly && '1' || '0' }}
+          FL_UF_SCAN_MIN: "240"
+          FL_MAX_RUNTIME: "420"
+        run: python3 job/fl_bluesky.py
