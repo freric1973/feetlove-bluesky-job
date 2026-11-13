@@ -2,7 +2,7 @@
 """Feetlove1973 – Bluesky Auto-Likes + Entfolger-Abgleich als GitHub-Actions-Job.
 
 Portierung von bluesky-autolike.php (Stand AUTOLIKE-500-20261113) und dem Abgleich aus
-bluesky-unfollowers.php. Gleiche Regeln: Frage/Beleidigung -> Prüfung, KI-Check (xAI), Like-Limit je Lauf
+bluesky-unfollowers.php. Gleiche Regeln: echte Frage/Beleidigung -> Prüfung, KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf
 (Setting bluesky_autolike_max, Standard 50), nie doppelt liken (viewer.like wird vor jedem Like geprüft),
 geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
@@ -186,17 +186,17 @@ def insult_hit(t: str) -> str:
 
 
 XAI_MODEL = "grok-4.3"
-SYSTEM_PROMPT = ('Du prüfst Antworten auf Social-Media-Posts des Bloggers Dennis. negative=true NUR, wenn die Antwort Dennis PERSÖNLICH beleidigt, beschimpft, verhöhnt, bedroht oder belästigt (Beleidigungen, Schimpfwörter gegen ihn, Hass, abwertende Aussagen über seine Person, sexuelle Belästigung, Drohungen). negative=false für alles andere, insbesondere: Kritik an einem Thema, an Firmen (z. B. Google), Produkten, Politik oder Meinungen; Widerspruch in der Sache; Sarkasmus oder Spott über das Thema; Witze, Wortspiele, Insider, Emojis; kurze oder rätselhafte Antworten (z. B. "Hex, Hex"); Zustimmung, Flirt, Neutrales. Im Zweifel negative=false. reason: max. 8 Wörter, deutsch.')
+SYSTEM_PROMPT = ('Du prüfst Antworten auf Social-Media-Posts des Bloggers Dennis. negative=true NUR, wenn die Antwort Dennis PERSÖNLICH beleidigt, beschimpft, verhöhnt, bedroht oder belästigt (Beleidigungen, Schimpfwörter gegen ihn, Hass, abwertende Aussagen über seine Person, sexuelle Belästigung, Drohungen). negative=false für alles andere, insbesondere: Kritik an einem Thema, an Firmen (z. B. Google), Produkten, Politik oder Meinungen; Widerspruch in der Sache; Sarkasmus oder Spott über das Thema; Witze, Wortspiele, Insider, Emojis; kurze oder rätselhafte Antworten (z. B. "Hex, Hex"); Zustimmung, Flirt, Neutrales. Im Zweifel negative=false. echte_frage=true NUR, wenn der Antwortende von Dennis wirklich eine Antwort erwartet (eine echte, an ihn gerichtete Frage). echte_frage=false für Witze, Sprüche, rhetorische oder ausrufende Fragen und Scherze mit Fragezeichen (z. B. „… Bluna!?“, „Wieso Der? 🤭“, „Bin ich etwa schon drin oder was?“). Im Zweifel, ob wirklich eine Antwort erwartet wird: echte_frage=true. reason: max. 8 Wörter, deutsch.')
 
 
-def ai_negative(text: str, parent: str, deadline: float | None = None) -> tuple[bool, str]:
+def ai_check(text: str, parent: str, deadline: float | None = None) -> tuple[bool, bool, str]:
     if not XAI_KEY:
         raise RuntimeError("xAI-Key fehlt")
-    schema = {"type": "object", "properties": {"negative": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["negative", "reason"], "additionalProperties": False}
+    schema = {"type": "object", "properties": {"negative": {"type": "boolean"}, "echte_frage": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["negative", "echte_frage", "reason"], "additionalProperties": False}
     payload = {"model": XAI_MODEL, "temperature": 0, "max_tokens": 300, "messages": [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "Ursprungspost (Kontext):\n" + parent[:500] + "\n\nAntwort:\n" + text[:1000]}],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "reply_sentiment", "strict": True, "schema": schema}}}
+        "response_format": {"type": "json_schema", "json_schema": {"name": "reply_check", "strict": True, "schema": schema}}}
     body = json.dumps(payload, ensure_ascii=False).encode()
     t_end = time.monotonic() + (deadline if deadline is not None else 90)
     d: dict = {}
@@ -235,26 +235,31 @@ def ai_negative(text: str, parent: str, deadline: float | None = None) -> tuple[
         r = json.loads((ch.get("message") or {}).get("content") or "")
     except ValueError:
         r = None
-    if not isinstance(r, dict) or "negative" not in r:
+    if not isinstance(r, dict) or "negative" not in r or "echte_frage" not in r:
         raise RuntimeError(f"KI-Antwort unklar ({ch.get('finish_reason') or '-'})")
-    return bool(r["negative"]), str(r.get("reason", "")).strip()[:120]
+    return bool(r["negative"]), bool(r["echte_frage"]), str(r.get("reason", "")).strip()[:120]
 
 
 def needs_ai(text: str) -> bool:
-    return not is_question(text) and not insult_hit(text)
+    # Fragen laufen jetzt durch die KI (echte_frage). Nur klare Beleidigungen brauchen keinen KI-Aufruf.
+    return not insult_hit(text)
 
 
 def classify(text: str, parent: str, deadline: float | None = None) -> tuple[str, str]:
-    if is_question(text):
-        return "review", "Frage"
     w = insult_hit(text)
     if w:
         return "review", f"Beleidigend: „{w}“"
     try:
-        neg, why = ai_negative(text, parent, deadline)
+        neg, echte_frage, why = ai_check(text, parent, deadline)
     except Exception as e:  # noqa: BLE001
+        if is_question(text):
+            return "review", "Frage"
         return "review", "KI-Prüfung fehlgeschlagen: " + str(e)
-    return ("review", "Persönlich beleidigend (KI): " + why) if neg else ("like", why)
+    if neg:
+        return "review", "Persönlich beleidigend (KI): " + why
+    if echte_frage:
+        return "review", "Frage"
+    return "like", why
 
 
 # ---------------- Hilfen ----------------
