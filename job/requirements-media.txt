@@ -1,0 +1,6 @@
+# BILDVORSCHLAG-20261114 – Medien-Indexer (CPU). torch/torchvision kommen aus dem CPU-Index (siehe Workflow).
+open_clip_torch==4.2.2
+transformers==5.23.0
+sentencepiece==0.2.3
+pillow==13.0.0
+numpy==2.5.4
