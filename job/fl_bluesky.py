@@ -5,7 +5,7 @@ Portierung von bluesky-autolike.php (Stand AUTOLIKE-500-20261113), dem Abgleich 
 bluesky-unfollowers.php und flb_af_run() aus bluesky-autofollow.php. Gleiche Regeln: echte Frage/Beleidigung -> Prüfung,
 KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf (Setting bluesky_autolike_max, Standard 50), nie doppelt liken
 (viewer.like wird vor jedem Like geprüft), geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
-Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), max. 10 je Lauf / 100 am Tag, nicht schon gefolgt,
+Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), Limit je Lauf und Tag aus den Admin-Einstellungen, nicht schon gefolgt,
 nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; bis einschließlich Setting autofollow_reunfollowed_until (Standard 2027-02-14, Europe/Berlin) auch Liker mit reason „von dir entfolgt“; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
@@ -35,6 +35,8 @@ FINISH_RESERVE = float(ENV("FL_FINISH_RESERVE", "25"))  # Rest für Abschluss-Me
 AF_BUDGET = float(ENV("FL_AF_BUDGET", "90"))        # festes Zeitfenster für Auto-Folgen am Laufende
 SLEEP_AF = float(ENV("FL_SLEEP_AF", "0.15"))        # Pause zwischen getLikes-/Profil-Seiten
 SLEEP_FOLLOW = float(ENV("FL_SLEEP_FOLLOW", "1.5"))  # Pause zwischen Follows (wie PHP usleep 1.5s)
+AF_LOCK_RETRIES = max(1, int(ENV("FL_AF_LOCK_RETRIES", "4")))  # af_save-Versuche bei HTTP 409 af_locked
+AF_LOCK_SLEEP = float(ENV("FL_AF_LOCK_SLEEP", "3"))            # Pause zwischen den Versuchen (3, 6, 9 s)
 AI_WORKERS = max(1, int(ENV("FL_AI_WORKERS", "8")))   # gleichzeitige KI-Prüfungen / Thread-Abrufe
 UF_STALE_MIN = int(ENV("FL_UF_STALE_MIN", "720"))   # Abgleich länger als X Min nicht fertig -> echter Fehler
 RUN_ID = ENV("GITHUB_RUN_ID", "local") + "-" + ENV("GITHUB_RUN_ATTEMPT", "1") + "-" + secrets.token_hex(4)
@@ -1032,6 +1034,23 @@ def af_is_reunfollowed_candidate(prev, did: str, reunfollowed: set[str], active:
     return bool(active and prev == "blocked" and did in reunfollowed)
 
 
+AF_REASON_DAY_LIMIT = "Tageslimit erreicht"
+AF_REASON_RUN_LIMIT = "Lauf-Limit – nächster Lauf"
+
+
+def af_is_capacity_reason(reason: str) -> bool:
+    return reason in (AF_REASON_DAY_LIMIT, AF_REASON_RUN_LIMIT) or reason.startswith("Zeitbudget")
+
+
+def af_leftover_reason(max_day: int, today: int, followed_this_run: int) -> str:
+    return AF_REASON_DAY_LIMIT if (today + followed_this_run) >= max_day else AF_REASON_RUN_LIMIT
+
+
+def af_is_locked_error(exc: BaseException) -> bool:
+    s = str(exc)
+    return "HTTP 409" in s and "af_locked" in s
+
+
 class AutoFollow:
     def __init__(self, bs: Bsky, begin: dict):
         self.bs = bs
@@ -1064,7 +1083,24 @@ class AutoFollow:
         if READONLY or not self.ops:
             self.ops = []
             return
-        bridge("af_save", ops=self.ops)
+        last = None
+        for attempt in range(AF_LOCK_RETRIES):
+            try:
+                bridge("af_save", ops=self.ops)
+                self.ops = []
+                return
+            except Exception as e:  # noqa: BLE001
+                if not af_is_locked_error(e):
+                    raise
+                last = e
+                if attempt < AF_LOCK_RETRIES - 1:
+                    delay = AF_LOCK_SLEEP * (attempt + 1)
+                    if delay > 0:
+                        time.sleep(delay)
+        has_follow = any(op.get("t") == "save" and op.get("followed_now") for op in self.ops)
+        if has_follow:
+            raise last  # type: ignore[misc]
+        af_hint(self.stats, "Speichern kurz gesperrt (af_locked) – nächster Lauf holt den Rest nach.")
         self.ops = []
 
     def add(self, op: dict) -> None:
@@ -1234,12 +1270,14 @@ class AutoFollow:
                     st["would_follow"] += 1
                     continue
                 if budget <= 0:
-                    st["limit_reached"] = True
-                    leftover_reason = "Tageslimit erreicht"
+                    leftover_reason = af_leftover_reason(self.max_day, self.today, int(st.get("followed") or 0))
+                    if leftover_reason == AF_REASON_DAY_LIMIT:
+                        st["limit_reached"] = True
+                    else:
+                        st["run_limit"] = True
                     self.save(did, p, src, "would_follow", leftover_reason)
                     st["would_follow"] += 1
                     # restliche ebenfalls merken, damit die Tageszahlen-Liste sie zeigt
-                    leftover_reason = leftover_reason
                     idx = list(todo.keys()).index(did)
                     for rest_did in list(todo.keys())[idx + 1:]:
                         rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
@@ -1288,7 +1326,21 @@ class AutoFollow:
                 st["ok"] = False
                 st["errors"].append(str(e)[:300])
         finally:
-            self.flush()
+            try:
+                self.flush()
+            except Exception as e:  # noqa: BLE001
+                # finally darf nicht werfen, sonst fehlen die Laufzahlen in der Auswertung
+                if af_is_locked_error(e):
+                    has_follow = any(op.get("t") == "save" and op.get("followed_now") for op in self.ops)
+                    if has_follow:
+                        st["ok"] = False
+                        af_err(st, str(e))
+                    else:
+                        af_hint(st, "Speichern kurz gesperrt (af_locked) – nächster Lauf holt den Rest nach.")
+                else:
+                    st["ok"] = False
+                    af_err(st, str(e))
+                self.ops = []
         if not st.get("status"):
             st["status"] = "readonly" if READONLY else ("dryrun" if self.dry else "ok")
         return st
