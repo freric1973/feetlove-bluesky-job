@@ -7,6 +7,7 @@ KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf (Setting bluesky_autolike_
 (viewer.like wird vor jedem Like geprüft), geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
 Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), Limit je Lauf und Tag aus den Admin-Einstellungen, nicht schon gefolgt,
 nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; bis einschließlich Setting autofollow_reunfollowed_until (Standard 2027-02-14, Europe/Berlin) auch Liker mit reason „von dir entfolgt“; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
+Ab 2026-11-14 22:00 Europe/Berlin neue Entfolger-Warteschlangen-Zeilen nur bei Like oder vorhandener Post-URI; bestehende Zeilen vor diesem Stichtag (created_at, UTC) behalten das bisherige Verhalten.
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
@@ -1034,6 +1035,45 @@ def af_is_reunfollowed_candidate(prev, did: str, reunfollowed: set[str], active:
     return bool(active and prev == "blocked" and did in reunfollowed)
 
 
+# Like-Pflicht für neue Entfolger-Einträge; created_at in der Tabelle ist UTC.
+AF_LIKE_CUTOFF = datetime(2026, 11, 14, 22, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+AF_POST_URI_RE = re.compile(r"^at://[^/]+/app\.bsky\.feed\.post/[A-Za-z0-9._~-]+$")
+
+
+def af_like_cutoff_utc() -> datetime:
+    return AF_LIKE_CUTOFF.astimezone(timezone.utc)
+
+
+def af_has_post_uri(src: str) -> bool:
+    return bool(src and AF_POST_URI_RE.match(src.strip()))
+
+
+def af_created_before_like_cutoff(created: str) -> bool:
+    """True bei fehlendem oder unlesbarem created_at (Bestand, alte Regel) oder Zeitpunkt vor dem Stichtag."""
+    raw = (created or "").strip()
+    if not raw:
+        return True
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", raw)
+    if not m:
+        return True
+    try:
+        dt = datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return dt < af_like_cutoff_utc()
+
+
+def af_may_enqueue_return(did: str, likers: dict[str, str], created: dict[str, str], uris: dict[str, str], known: dict[str, str]) -> bool:
+    if did in likers:
+        return True
+    src = uris.get(did) or ""
+    if af_has_post_uri(src):
+        return True
+    if did not in known:
+        return False
+    return af_created_before_like_cutoff(created.get(did, ""))
+
+
 AF_REASON_DAY_LIMIT = "Tageslimit erreicht"
 AF_REASON_RUN_LIMIT = "Lauf-Limit – nächster Lauf"
 
@@ -1074,6 +1114,8 @@ class AutoFollow:
         self.reunfollowed_until = af_reunfollowed_until((st.get("reunfollowed_until") if isinstance(st, dict) else None))
         self.reunfollowed_active = af_reunfollowed_active(self.reunfollowed_until)
         self.reunfollowed = set(str(x) for x in (self.af.get("reunfollowed") or []))
+        self.created = {str(k): str(v or "") for k, v in (self.af.get("created_at") or {}).items()}
+        self.uris = {str(k): str(v or "") for k, v in (self.af.get("source_uris") or {}).items()}
         self.cache_new: dict | None = None
         self.new_cursor: str | None = None
         self.stats: dict = {"ok": True, "dryrun": self.dry, "posts": 0, "likers": 0, "followed": 0,
@@ -1219,6 +1261,8 @@ class AutoFollow:
                 prev = self.known.get(did)
                 if prev is None or (prev == "would_follow" and not self.dry) or af_is_reunfollowed_candidate(prev, did, self.reunfollowed, self.reunfollowed_active):
                     todo[did] = src
+            # Frühere Entfolger in rotierenden Stapeln. Ab 2026-11-14 22:00 Europe/Berlin
+            # neue Warteschlangen-Zeilen nur bei Like oder Post-URI; Bestand vor dem Stichtag bleibt.
             return_dids = sorted(self.excluded)
             if return_dids:
                 after = self.return_cursor
@@ -1226,7 +1270,14 @@ class AutoFollow:
                 if not batch:
                     batch = return_dids
                 batch = batch[:50]
-                returns = {d: todo.get(d, "") for d in batch}
+                returns: dict[str, str] = {}
+                for d in batch:
+                    if d in todo:
+                        returns[d] = todo[d]
+                        continue
+                    if not af_may_enqueue_return(d, likers, self.created, self.uris, self.known):
+                        continue
+                    returns[d] = likers.get(d) or self.uris.get(d) or ""
                 todo = {**returns, **todo}
                 if not self.dry:
                     self.new_cursor = batch[-1]
