@@ -6,7 +6,7 @@ bluesky-unfollowers.php und flb_af_run() aus bluesky-autofollow.php. Gleiche Reg
 KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf (Setting bluesky_autolike_max, Standard 50), nie doppelt liken
 (viewer.like wird vor jedem Like geprüft), geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
 Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), max. 10 je Lauf / 100 am Tag, nicht schon gefolgt,
-nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
+nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; bis einschließlich Setting autofollow_reunfollowed_until (Standard 2027-02-14, Europe/Berlin) auch Liker mit reason „von dir entfolgt“; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
@@ -1000,6 +1000,38 @@ def af_follow(bs: Bsky, did: str) -> str:
     return str(d.get("uri") or "")
 
 
+
+AF_REUNFOLLOWED_UNTIL_DEFAULT = "2027-02-14"
+AF_REASON_SELF_UNFOLLOWED = "von dir entfolgt"
+
+
+def af_reunfollowed_until(raw=None) -> str:
+    """Stichtag als YYYY-MM-DD; ungültige Werte fallen auf den Standard zurück."""
+    s = str(raw or "").strip() or AF_REUNFOLLOWED_UNTIL_DEFAULT
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return s
+    except ValueError:
+        return AF_REUNFOLLOWED_UNTIL_DEFAULT
+
+
+def af_reunfollowed_active(until=None, now: datetime | None = None) -> bool:
+    """True bis einschließlich Stichtag (Europe/Berlin). Ab dem Folgetag gilt wieder die alte Sperre."""
+    tz = ZoneInfo("Europe/Berlin")
+    if now is None:
+        now = datetime.now(tz)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=tz)
+    else:
+        now = now.astimezone(tz)
+    deadline = datetime.strptime(af_reunfollowed_until(until), "%Y-%m-%d").date()
+    return now.date() <= deadline
+
+
+def af_is_reunfollowed_candidate(prev, did: str, reunfollowed: set[str], active: bool) -> bool:
+    return bool(active and prev == "blocked" and did in reunfollowed)
+
+
 class AutoFollow:
     def __init__(self, bs: Bsky, begin: dict):
         self.bs = bs
@@ -1020,6 +1052,9 @@ class AutoFollow:
         self.cache = dict(self.af.get("cache") or {})
         self.recheck = [str(x) for x in (self.af.get("recheck") or [])]
         self.backcheck_rows = {str(k): v for k, v in (self.af.get("backcheck") or {}).items()}
+        self.reunfollowed_until = af_reunfollowed_until((st.get("reunfollowed_until") if isinstance(st, dict) else None))
+        self.reunfollowed_active = af_reunfollowed_active(self.reunfollowed_until)
+        self.reunfollowed = set(str(x) for x in (self.af.get("reunfollowed") or []))
         self.cache_new: dict | None = None
         self.new_cursor: str | None = None
         self.stats: dict = {"ok": True, "dryrun": self.dry, "posts": 0, "likers": 0, "followed": 0,
@@ -1065,8 +1100,9 @@ class AutoFollow:
                     if not p:
                         continue
                     if not (p.get("viewer") or {}).get("following"):
-                        self.add({"t": "mark_blocked", "did": did, "reason": "von dir entfolgt"})
+                        self.add({"t": "mark_blocked", "did": did, "reason": AF_REASON_SELF_UNFOLLOWED})
                         self.known[did] = "blocked"
+                        self.reunfollowed.add(did)
                         st["blocked_new"] = st.get("blocked_new", 0) + 1
                     else:
                         self.add({"t": "checked", "did": did})
@@ -1145,7 +1181,7 @@ class AutoFollow:
                 if did in todo:
                     continue
                 prev = self.known.get(did)
-                if prev is None or (prev == "would_follow" and not self.dry):
+                if prev is None or (prev == "would_follow" and not self.dry) or af_is_reunfollowed_candidate(prev, did, self.reunfollowed, self.reunfollowed_active):
                     todo[did] = src
             return_dids = sorted(self.excluded)
             if return_dids:
