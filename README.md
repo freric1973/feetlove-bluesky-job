@@ -10,3 +10,8 @@ Keine Geheimnisse ins Repo schreiben. Handstart über „Actions → Run workflo
 - Reicht die Zeit für den Follower-Abruf nicht: Status „deferred“ (Exit 0), nächster Lauf holt ihn nach.
   Erst wenn seit FL_UF_STALE_MIN (720 Min) kein Abgleich fertig wurde, gilt das als Fehler.
 - Log zeigt Zeiten je Phase („Zeiten (s)“) und KI-Statistik.
+
+## Auto-Folgen (14.11.2026)
+Zusätzlicher Schritt nach Auto-Likes und Entfolger-Abgleich, Regeln wie flb_af_run() auf der Webseite.
+Nur-Lesen (FL_READONLY=1 bzw. Workflow-Häkchen) folgt nicht und schreibt nichts.
+Ergebnis nur über die Bridge (af_save / finish).

@@ -1,11 +1,11 @@
-name: Bluesky Auto-Likes + Entfolger
+name: Bluesky Auto-Likes + Entfolger + Auto-Folgen
 
 on:
   # Angestoßen wird alle 30 Minuten von cron-job.org (workflow_dispatch); kein eigener GitHub-Zeitplan.
   workflow_dispatch:
     inputs:
       readonly:
-        description: "Nur lesen (keine Likes, kein Entfolgen, nichts speichern)"
+        description: "Nur lesen (keine Likes, kein Entfolgen, kein Folgen, nichts speichern)"
         type: boolean
         default: true
 

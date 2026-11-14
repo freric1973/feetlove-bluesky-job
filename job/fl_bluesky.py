@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Feetlove1973 – Bluesky Auto-Likes + Entfolger-Abgleich als GitHub-Actions-Job.
+"""Feetlove1973 – Bluesky Auto-Likes, Entfolger-Abgleich und Auto-Folgen als GitHub-Actions-Job.
 
-Portierung von bluesky-autolike.php (Stand AUTOLIKE-500-20261113) und dem Abgleich aus
-bluesky-unfollowers.php. Gleiche Regeln: echte Frage/Beleidigung -> Prüfung, KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf
-(Setting bluesky_autolike_max, Standard 50), nie doppelt liken (viewer.like wird vor jedem Like geprüft),
-geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
+Portierung von bluesky-autolike.php (Stand AUTOLIKE-500-20261113), dem Abgleich aus
+bluesky-unfollowers.php und flb_af_run() aus bluesky-autofollow.php. Gleiche Regeln: echte Frage/Beleidigung -> Prüfung,
+KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf (Setting bluesky_autolike_max, Standard 50), nie doppelt liken
+(viewer.like wird vor jedem Like geprüft), geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
+Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), max. 10 je Lauf / 100 am Tag, nicht schon gefolgt,
+nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
+Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
 """
@@ -12,6 +15,7 @@ from __future__ import annotations
 import hashlib, hmac, json, os, re, secrets, sys, threading, time, urllib.error, urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as fwait
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 ENV = os.environ.get
 BRIDGE_URL = ENV("FL_BRIDGE_URL", "")
@@ -22,12 +26,15 @@ BSKY_SERVICE = ENV("BSKY_SERVICE", "https://bsky.social").rstrip("/")
 RELAY = ENV("BSKY_RELAY", "https://bsky.network").rstrip("/")
 XAI_KEY = ENV("XAI_API_KEY", "")
 XAI_BASE = ENV("XAI_BASE", "https://api.x.ai").rstrip("/")
-READONLY = ENV("FL_READONLY", "0") == "1"          # nur lesen: keine Likes, kein Entfolgen, nichts in die DB
+READONLY = ENV("FL_READONLY", "0") == "1"          # nur lesen: keine Likes, kein Entfolgen, kein Folgen, nichts in die DB
 UF_SCAN_MIN = int(ENV("FL_UF_SCAN_MIN", "240"))     # Follower-Abgleich höchstens alle X Minuten
 MAX_RUNTIME = float(ENV("FL_MAX_RUNTIME", "420"))   # Sicherheitsgrenze je Lauf (Sekunden)
 SLEEP_LIKE = float(ENV("FL_SLEEP_LIKE", "0.7"))
 LIKES_BUDGET = float(ENV("FL_LIKES_BUDGET", "240"))  # Auto-Likes enden spätestens nach X s, wenn der Abgleich fällig ist
 FINISH_RESERVE = float(ENV("FL_FINISH_RESERVE", "25"))  # Rest für Abschluss-Meldung an die Seite
+AF_BUDGET = float(ENV("FL_AF_BUDGET", "90"))        # festes Zeitfenster für Auto-Folgen am Laufende
+SLEEP_AF = float(ENV("FL_SLEEP_AF", "0.15"))        # Pause zwischen getLikes-/Profil-Seiten
+SLEEP_FOLLOW = float(ENV("FL_SLEEP_FOLLOW", "1.5"))  # Pause zwischen Follows (wie PHP usleep 1.5s)
 AI_WORKERS = max(1, int(ENV("FL_AI_WORKERS", "8")))   # gleichzeitige KI-Prüfungen / Thread-Abrufe
 UF_STALE_MIN = int(ENV("FL_UF_STALE_MIN", "720"))   # Abgleich länger als X Min nicht fertig -> echter Fehler
 RUN_ID = ENV("GITHUB_RUN_ID", "local") + "-" + ENV("GITHUB_RUN_ATTEMPT", "1") + "-" + secrets.token_hex(4)
@@ -434,6 +441,9 @@ class AutoLike:
 
     def decide(self, c: dict, prev) -> str:
         s = self.stats
+        # Von Hand in den Tageszahlen übersprungen: nie nachträglich liken.
+        if prev == "dismissed":
+            return "ok"
         if self.needs_check(c, prev, self.flagged, self.dry):
             r = self.classify_c(c["uri"], c["text"], c["root_text"])
             if r is None:
@@ -891,6 +901,363 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
     return res
 
 
+# ---------------- Auto-Folgen (1:1 flb_af_run in bluesky-autofollow.php) ----------------
+
+_DID_AF = re.compile(r"^did:[a-z0-9]+:[A-Za-z0-9._:%-]+$")
+AF_BAD_LABELS = {"spam", "!hide", "!takedown", "!warn", "impersonation", "scam"}
+
+
+def af_today_start_utc() -> str:
+    start = datetime.now(ZoneInfo("Europe/Berlin")).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def af_berlin_now() -> str:
+    return datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def af_own_posts(bs: Bsky, days: int) -> list:
+    cutoff = int(time.time()) - days * 86400
+    out, cursor = [], None
+    for _ in range(5):
+        q = {"actor": bs.did, "limit": 100, "filter": "posts_and_author_threads"}
+        if cursor:
+            q["cursor"] = cursor
+        d = bs.get("app.bsky.feed.getAuthorFeed", q)
+        old = False
+        for item in d.get("feed") or []:
+            p = item.get("post") or {}
+            if (p.get("author") or {}).get("did") != bs.did or item.get("reason"):
+                continue
+            rec = p.get("record") or {}
+            pt = ts(str(rec.get("createdAt") or "")) or 0
+            if pt < cutoff:
+                if not rec.get("reply"):
+                    old = True
+                continue
+            out.append(p)
+        cursor = d.get("cursor")
+        if not cursor or old:
+            break
+    return out
+
+
+def af_cache_stale(cache: dict, uri: str, count: int, max_age: int = 21600) -> bool:
+    row = cache.get(uri)
+    if not isinstance(row, (list, tuple)) or len(row) < 2:
+        return True
+    return int(row[0]) != count or time.time() - int(row[1]) > max_age
+
+
+def af_profiles(bs: Bsky, dids: list[str]) -> dict:
+    out = {}
+    uniq = [d for d in dict.fromkeys(dids) if d and _DID_AF.match(d)]
+    for i in range(0, len(uniq), 25):
+        chunk = uniq[i:i + 25]
+        qs = "&".join("actors=" + urllib.parse.quote(d, safe="") for d in chunk)
+        d = bs.get("app.bsky.actor.getProfiles", qs)
+        for p in d.get("profiles") or []:
+            if p.get("did"):
+                out[str(p["did"])] = p
+        if SLEEP_AF:
+            time.sleep(SLEEP_AF)
+    return out
+
+
+def af_bad_label(p: dict) -> str:
+    for lab in p.get("labels") or []:
+        v = str((lab or {}).get("val") or "")
+        if v in AF_BAD_LABELS:
+            return v
+    return ""
+
+
+def af_hint(stats: dict, msg: str) -> None:
+    h = stats.setdefault("hints", [])
+    if msg not in h:
+        h.append(msg[:300])
+
+
+def af_err(stats: dict, msg: str) -> None:
+    if msg.startswith(TRANSIENT_PREFIX):
+        af_hint(stats, msg)
+        stats["transient"] = True
+        return
+    stats["error_count"] = stats.get("error_count", 0) + 1
+    errs = stats.setdefault("errors", [])
+    if len(errs) < 5 and msg not in errs:
+        errs.append(msg[:300])
+
+
+def af_follow(bs: Bsky, did: str) -> str:
+    if READONLY:
+        raise RuntimeError("READONLY")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+    d = bs.post("com.atproto.repo.createRecord", {
+        "repo": bs.did, "collection": "app.bsky.graph.follow",
+        "record": {"$type": "app.bsky.graph.follow", "subject": did, "createdAt": now},
+    })
+    return str(d.get("uri") or "")
+
+
+class AutoFollow:
+    def __init__(self, bs: Bsky, begin: dict):
+        self.bs = bs
+        self.af = begin.get("af") or {}
+        self.ops: list[dict] = []
+        st = self.af.get("settings") or {}
+        self.enabled = bool(st.get("enabled"))
+        self.dry = bool(st.get("dryrun"))
+        self.max_day = max(1, min(500, int(st.get("max_day") or 100)))
+        self.max_run = max(1, min(50, int(st.get("max_run") or 10)))
+        self.days = max(1, min(30, int(st.get("days") or 7)))
+        self.today = int(self.af.get("today") or 0)
+        self.known = {str(k): str(v) for k, v in (self.af.get("known") or {}).items()}
+        self.pending = {str(k): str(v) for k, v in (self.af.get("pending") or {}).items()}
+        self.excluded = set(str(x) for x in (self.af.get("exclusions") or []))
+        self.flagged = {str(k): str(v) for k, v in (self.af.get("flagged") or begin.get("flagged") or {}).items()}
+        self.return_cursor = str(self.af.get("return_cursor") or "")
+        self.cache = dict(self.af.get("cache") or {})
+        self.recheck = [str(x) for x in (self.af.get("recheck") or [])]
+        self.backcheck_rows = {str(k): v for k, v in (self.af.get("backcheck") or {}).items()}
+        self.cache_new: dict | None = None
+        self.new_cursor: str | None = None
+        self.stats: dict = {"ok": True, "dryrun": self.dry, "posts": 0, "likers": 0, "followed": 0,
+                            "would_follow": 0, "skipped": 0, "blocked_new": 0, "today": self.today, "errors": []}
+
+    def flush(self) -> None:
+        if READONLY or not self.ops:
+            self.ops = []
+            return
+        bridge("af_save", ops=self.ops)
+        self.ops = []
+
+    def add(self, op: dict) -> None:
+        if READONLY:
+            return
+        self.ops.append(op)
+        if len(self.ops) >= 40:
+            self.flush()
+
+    def save(self, did: str, p: dict, src: str, status: str, reason: str, follow_uri: str = "", followed_now: bool = False) -> None:
+        self.add({"t": "save", "did": did, "handle": str(p.get("handle") or ""), "display_name": str(p.get("displayName") or ""),
+                  "avatar_url": str(p.get("avatar") or ""), "source_post_uri": src, "status": status,
+                  "reason": reason, "follow_uri": follow_uri, "followed_now": followed_now})
+        self.known[did] = status
+
+    def run(self) -> dict:
+        st = self.stats
+        if not self.af.get("ready"):
+            st["status"] = "missing"
+            return st
+        if not self.enabled:
+            st["status"] = "disabled"
+            return st
+        if READONLY:
+            st["status"] = "readonly"
+        budget = 10**9 if self.dry else max(0, min(self.max_run, self.max_day - self.today))
+        try:
+            # 1) Entfolgt-Erkennung
+            if self.recheck and left() >= 8:
+                pp = af_profiles(self.bs, self.recheck)
+                for did in self.recheck:
+                    p = pp.get(did)
+                    if not p:
+                        continue
+                    if not (p.get("viewer") or {}).get("following"):
+                        self.add({"t": "mark_blocked", "did": did, "reason": "von dir entfolgt"})
+                        self.known[did] = "blocked"
+                        st["blocked_new"] = st.get("blocked_new", 0) + 1
+                    else:
+                        self.add({"t": "checked", "did": did})
+            # 1b) Zurückgefolgt
+            if self.backcheck_rows and left() >= 8:
+                pp = af_profiles(self.bs, list(self.backcheck_rows.keys()))
+                n = 0
+                for did in self.backcheck_rows:
+                    p = pp.get(did)
+                    if p is not None and (p.get("viewer") or {}).get("followedBy"):
+                        self.add({"t": "backcheck_yes", "did": did}); n += 1
+                    else:
+                        self.add({"t": "backcheck_touch", "did": did})
+                st["followed_back_new"] = n
+            # 2) Liker eigener Posts
+            likers: dict[str, str] = {}
+            new_cache: dict = {}
+            time_limit = False
+            for p in af_own_posts(self.bs, self.days):
+                lc = int(p.get("likeCount") or 0)
+                uri = str(p.get("uri") or "")
+                if lc == 0 or not uri:
+                    continue
+                if not af_cache_stale(self.cache, uri, lc):
+                    new_cache[uri] = self.cache[uri]
+                    continue
+                if left() < 8:
+                    time_limit = True
+                    break
+                st["posts"] += 1
+                cursor, pages, ok_post = None, 0, True
+                while True:
+                    if left() < 8:
+                        time_limit = True
+                        ok_post = False
+                        break
+                    q = {"uri": uri, "limit": 100}
+                    if cursor:
+                        q["cursor"] = cursor
+                    try:
+                        d = self.bs.get("app.bsky.feed.getLikes", q)
+                    except RateLimit:
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        if "RATE_LIMIT" in str(e):
+                            raise RateLimit() from e
+                        af_err(st, str(e))
+                        ok_post = False
+                        break
+                    for lk in d.get("likes") or []:
+                        actor = (lk or {}).get("actor") or {}
+                        did = str(actor.get("did") or "")
+                        if did and did != self.bs.did and did not in likers:
+                            likers[did] = uri
+                    cursor = d.get("cursor")
+                    pages += 1
+                    if SLEEP_AF:
+                        time.sleep(SLEEP_AF)
+                    if not cursor or pages >= 20:
+                        break
+                if ok_post:
+                    new_cache[uri] = [lc, int(time.time())]
+            if time_limit:
+                st["time_limit"] = True
+                merged = {**self.cache, **new_cache}
+                self.cache_new = merged
+            else:
+                self.cache_new = new_cache
+            # 3) Todo: zuerst would_follow, dann neue Liker, dann frühere Entfolger
+            todo: dict[str, str] = {}
+            if not self.dry:
+                for did, src in self.pending.items():
+                    todo[did] = src
+                st["pending"] = len(self.pending)
+            for did, src in likers.items():
+                if did in todo:
+                    continue
+                prev = self.known.get(did)
+                if prev is None or (prev == "would_follow" and not self.dry):
+                    todo[did] = src
+            return_dids = sorted(self.excluded)
+            if return_dids:
+                after = self.return_cursor
+                batch = [d for d in return_dids if d > after]
+                if not batch:
+                    batch = return_dids
+                batch = batch[:50]
+                returns = {d: todo.get(d, "") for d in batch}
+                todo = {**returns, **todo}
+                if not self.dry:
+                    self.new_cursor = batch[-1]
+            st["likers"] = len(likers)
+            profiles = af_profiles(self.bs, list(todo.keys())) if todo else {}
+            leftover_reason = ""
+            for did, src in todo.items():
+                p = profiles.get(did)
+                if p is None:
+                    if did in self.pending:
+                        self.save(did, {}, src, "skipped", "Profil nicht gefunden")
+                        st["skipped"] += 1
+                    continue
+                v = p.get("viewer") or {}
+                if did in self.excluded and not v.get("followedBy"):
+                    self.add({"t": "mark_blocked", "did": did, "reason": "Früherer Entfolger: wartet auf erneutes Folgen"})
+                    st["skipped"] += 1
+                    continue
+                if v.get("following"):
+                    self.save(did, p, src, "skipped", "folgst bereits", str(v.get("following") or ""))
+                    st["skipped"] += 1
+                    continue
+                if v.get("blocking") or v.get("blockedBy") or v.get("muted"):
+                    self.save(did, p, src, "skipped", "blockiert/stummgeschaltet")
+                    st["skipped"] += 1
+                    af_hint(st, "Auto-Folgen: blockiertes oder stummgeschaltetes Konto übersprungen (kein Fehler).")
+                    continue
+                flag = self.flagged.get(did) or ""
+                if flag:
+                    self.save(did, p, src, "skipped", flag)
+                    st["skipped"] += 1
+                    continue
+                lab = af_bad_label(p)
+                if lab:
+                    self.save(did, p, src, "skipped", "Label: " + lab)
+                    st["skipped"] += 1
+                    continue
+                if self.dry or READONLY:
+                    if not READONLY:
+                        self.save(did, p, src, "would_follow", "würde folgen")
+                    st["would_follow"] += 1
+                    continue
+                if budget <= 0:
+                    st["limit_reached"] = True
+                    leftover_reason = "Tageslimit erreicht"
+                    self.save(did, p, src, "would_follow", leftover_reason)
+                    st["would_follow"] += 1
+                    # restliche ebenfalls merken, damit die Tageszahlen-Liste sie zeigt
+                    leftover_reason = leftover_reason
+                    idx = list(todo.keys()).index(did)
+                    for rest_did in list(todo.keys())[idx + 1:]:
+                        rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
+                        self.save(rest_did, rp, todo[rest_did], "would_follow", leftover_reason)
+                        st["would_follow"] += 1
+                    break
+                if left() < 8:
+                    st["time_limit"] = True
+                    leftover_reason = "Zeitbudget – nächster Lauf"
+                    self.save(did, p, src, "would_follow", leftover_reason)
+                    st["would_follow"] += 1
+                    idx = list(todo.keys()).index(did)
+                    for rest_did in list(todo.keys())[idx + 1:]:
+                        rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
+                        self.save(rest_did, rp, todo[rest_did], "would_follow", leftover_reason)
+                        st["would_follow"] += 1
+                    break
+                try:
+                    fu = af_follow(self.bs, did)
+                except RateLimit:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    if str(e) == "RATE_LIMIT":
+                        raise RateLimit() from e
+                    af_err(st, str(e))
+                    continue
+                if not fu:
+                    af_err(st, "Bluesky hat das Folgen nicht bestätigt.")
+                    continue
+                self.save(did, p, src, "followed", "automatisch", fu, True)
+                self.add({"t": "set_fb_before", "did": did, "before": 1 if v.get("followedBy") else 0})
+                st["followed"] += 1
+                budget -= 1
+                if SLEEP_FOLLOW:
+                    time.sleep(SLEEP_FOLLOW)
+            st["today"] = self.today + st["followed"]
+        except RateLimit:
+            st["ok"] = False
+            st["errors"].append("Bluesky-Rate-Limit erreicht – nächster Lauf macht weiter")
+        except Exception as e:  # noqa: BLE001
+            if str(e).startswith(TRANSIENT_PREFIX):
+                af_hint(st, str(e))
+                st["transient"] = True
+                st["time_limit"] = True
+            else:
+                st["ok"] = False
+                st["errors"].append(str(e)[:300])
+        finally:
+            self.flush()
+        if not st.get("status"):
+            st["status"] = "readonly" if READONLY else ("dryrun" if self.dry else "ok")
+        return st
+
+
 # ---------------- Ablauf ----------------
 
 def main() -> int:
@@ -908,7 +1275,8 @@ def main() -> int:
         log(f"Kein Lauf: {st.get('status')} {st.get('reason', '')}"); return 0
     XAI_MODEL = st.get("xai_model") or XAI_MODEL
     al_stats: dict = {"ok": True, "status": "disabled", "errors": []}; uf_res: dict = {"status": "skipped"}
-    al = None; ran = False
+    af_stats: dict = {"ok": True, "status": "skipped", "errors": []}
+    al = None; af = None; ran = False; af_ran = False
     timing: dict = {}
     uf = st.get("uf") or {}
     last = uf.get("last_completed") or ""
@@ -916,6 +1284,8 @@ def main() -> int:
     uf_due = bool(uf.get("ready") and uf.get("enabled") and uf_age >= UF_SCAN_MIN * 60)
     uf_first = uf_due and uf_age >= 2 * UF_SCAN_MIN * 60     # deutlich überfällig -> Abgleich vor den Likes
     end_all = MAX_RUNTIME - FINISH_RESERVE
+    af_on = bool((st.get("af") or {}).get("ready") and (st.get("af") or {}).get("settings", {}).get("enabled"))
+    likes_uf_end = end_all - (AF_BUDGET if af_on else 0)
 
     def do_uf() -> dict:
         t1 = time.monotonic()
@@ -928,27 +1298,41 @@ def main() -> int:
     try:
         bs = Bsky()
         if uf_first:
-            phase(end_all - 90)          # mind. 90 s bleiben für die Likes
+            phase(likes_uf_end - 90)          # mind. 90 s bleiben für die Likes
             uf_res = do_uf()
         if st["settings"].get("enabled"):
-            phase(min(LIKES_BUDGET, end_all) if (uf_due and not uf_first) else end_all)
+            phase(min(LIKES_BUDGET, likes_uf_end) if (uf_due and not uf_first) else likes_uf_end)
             t1 = time.monotonic()
             al = AutoLike(bs, st); al_stats = al.run(); ran = True
             timing["auto_likes"] = round(time.monotonic() - t1, 1); timing["auto_likes_schritte"] = al.t
         if not uf_first:
-            phase(end_all)
+            phase(likes_uf_end)
             uf_res = do_uf()
+        if (st.get("af") or {}).get("ready"):
+            phase(end_all)
+            t1 = time.monotonic()
+            try:
+                af = AutoFollow(bs, st); af_stats = af.run(); af_ran = True
+            except Exception as e:  # noqa: BLE001
+                af_stats = {"ok": False, "status": "error", "errors": [str(e)[:300]]}
+            timing["auto_follow"] = round(time.monotonic() - t1, 1)
     except Exception as e:  # noqa: BLE001
         al_stats = {"ok": False, "status": "error", "errors": [str(e)[:300]]}
     finally:
-        clean = bool(al_stats.get("ok", True)) and not al_stats.get("errors") and uf_res.get("status") != "error"
+        af_ok = bool(af_stats.get("ok", True)) and not af_stats.get("errors")
+        clean = bool(al_stats.get("ok", True)) and not al_stats.get("errors") and uf_res.get("status") != "error" and af_ok
         # "deferred" meldet die Seite als in_progress -> alter Cron sieht den Abgleich weiter als fällig an
         uf_site = dict(uf_res, status="in_progress") if uf_res.get("status") == "deferred" else uf_res
-        fin = {"stats": al_stats, "autolike_ran": ran and not READONLY, "uf": uf_site, "clean": clean and not READONLY}
+        fin = {"stats": al_stats, "autolike_ran": ran and not READONLY, "uf": uf_site,
+               "af": af_stats, "af_ran": af_ran and not READONLY, "clean": clean and not READONLY}
         if al and al.notif_new is not None and not READONLY:
             fin["notif"] = al.notif_new
         if al and al.cache_new is not None and not READONLY:
             fin["thread_cache"] = al.cache_new
+        if af and af.cache_new is not None and not READONLY:
+            fin["af_cache"] = af.cache_new
+        if af and af.new_cursor is not None and not READONLY:
+            fin["af_return_cursor"] = af.new_cursor
         bridge("finish", **fin)
     summary = {k: v for k, v in al_stats.items() if k not in ("errors", "hints")}
     log("Auto-Likes: " + json.dumps(summary, ensure_ascii=False))
@@ -957,6 +1341,11 @@ def main() -> int:
     if al_stats.get("hints"):
         log("Hinweise (kein Fehler): " + "; ".join(al_stats["hints"]))
     log("Entfolger: " + json.dumps({k: v for k, v in uf_res.items() if k != "pending"}, ensure_ascii=False))
+    log("Auto-Folgen: " + json.dumps({k: v for k, v in af_stats.items() if k not in ("errors", "hints")}, ensure_ascii=False))
+    if af_stats.get("errors"):
+        log("Auto-Folgen Fehler: " + "; ".join(af_stats["errors"]))
+    if af_stats.get("hints"):
+        log("Hinweise (kein Fehler): " + "; ".join(af_stats["hints"]))
     if _AI["calls"]:
         log(f"KI: {_AI['calls']} Aufrufe, Ø {_AI['secs'] / _AI['calls']:.1f} s, {_AI['retries']} Wiederholungen, {AI_WORKERS} parallel")
     log("Zeiten (s): " + json.dumps(timing, ensure_ascii=False) + (" | Abgleich zuerst" if uf_first else ""))
