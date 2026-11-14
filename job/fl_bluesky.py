@@ -73,6 +73,17 @@ class RateLimit(Exception):
     pass
 
 
+class BskyHttpError(RuntimeError):
+    """HTTP-Fehler von Bluesky mit Status und Fehlercode (abwärtskompatibel zu RuntimeError)."""
+    def __init__(self, msg: str, code: int = 0, error: str = "", body: dict | None = None):
+        super().__init__(msg)
+        self.code = int(code)
+        self.error = str(error or "")
+        self.body = body or {}
+
+
+
+
 def log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}Z] {msg}", flush=True)
 
@@ -100,7 +111,8 @@ def http(url: str, headers: dict | None = None, body: bytes | None = None, timeo
             if e.code == 429:
                 raise RateLimit()
             msg = str(d.get("message") or d.get("error") or f"HTTP {e.code}") if isinstance(d, dict) else f"HTTP {e.code}"
-            last = RuntimeError(f"{TRANSIENT_PREFIX}{msg} (HTTP {e.code})" if e.code >= 500 else msg)
+            err = str(d.get("error") or "") if isinstance(d, dict) else ""
+            last = BskyHttpError(f"{TRANSIENT_PREFIX}{msg} (HTTP {e.code})" if e.code >= 500 else msg, e.code, err, d if isinstance(d, dict) else {})
             if e.code < 500 or body is not None:   # Schreibaufrufe nie automatisch wiederholen
                 raise last
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
@@ -771,8 +783,20 @@ class AutoLike:
 
 # ---------------- Entfolger-Abgleich ----------------
 
+UF_GONE = {"deleted", "takendown", "missing"}
+UF_WEEKLY = {"deactivated", "suspended"}
+UF_GONE_RETRY = 86400
+UF_GONE_MSG = "Konto gelöscht – Follow entfernt"
+UF_GONE_NONE = "Konto gelöscht – kein Follow mehr"
+
+
 def account_status(did: str) -> str:
-    r = http(RELAY + "/xrpc/com.atproto.sync.getRepoStatus?did=" + urllib.parse.quote(did, safe=""), {"Accept": "application/json"})
+    try:
+        r = http(RELAY + "/xrpc/com.atproto.sync.getRepoStatus?did=" + urllib.parse.quote(did, safe=""), {"Accept": "application/json"})
+    except BskyHttpError as e:
+        if e.code == 404 or e.error == "RepoNotFound":
+            return "missing"
+        raise
     if r.get("did") != did or not isinstance(r.get("active"), bool):
         raise RuntimeError("Kontostatus nicht sicher prüfbar.")
     if r["active"]:
@@ -780,6 +804,111 @@ def account_status(did: str) -> str:
             raise RuntimeError("Kontostatus derzeit eingeschränkt.")
         return "active"
     return r.get("status") if r.get("status") in ("deactivated", "deleted", "suspended", "takendown") else "inactive"
+
+
+def profile_status(bs: "Bsky", did: str) -> tuple[str, dict | None]:
+    """Aktives Profil oder gone/deactivated-Status. Fehlende DIDs in getProfiles gelten als missing."""
+    try:
+        prof = (bs.get("app.bsky.actor.getProfiles", "actors=" + urllib.parse.quote(did, safe="")).get("profiles") or [])
+    except BskyHttpError as e:
+        err, msg = e.error, str(e).lower()
+        if err == "AccountTakedown" or "accounttakedown" in msg:
+            return "takendown", None
+        if err == "AccountDeactivated" or "accountdeactivated" in msg:
+            return "deactivated", None
+        if "profile not found" in msg:
+            return "missing", None
+        raise
+    p = next((x for x in prof if isinstance(x, dict) and x.get("did") == did), None)
+    if not p:
+        return "missing", None
+    return "active", p
+
+
+def uf_gone_first(row: dict, status: str) -> int:
+    """Unixzeit der ersten Gone-Bestätigung, 0 wenn noch keine vorliegt."""
+    if status not in UF_GONE:
+        return 0
+    first = int(row.get("gone_first_seen") or 0)
+    if first <= 0:
+        prev = str(row.get("account_status") or "")
+        checked = str(row.get("checked_at") or "")
+        if prev in UF_GONE and checked:
+            first = ts(checked.replace(" ", "T") + "+00:00")
+    return first if first > 0 else 0
+
+
+def uf_gone_ready(row: dict, status: str, now: float | None = None) -> bool:
+    first = uf_gone_first(row, status)
+    return first > 0 and ((time.time() if now is None else now) - first) >= UF_GONE_RETRY
+
+
+def uf_bridge(typ: str, **kw) -> dict:
+    """uf_event; unbekannte Typen einer älteren Brücke nicht als Fehler behandeln."""
+    try:
+        return bridge("uf_event", type=typ, **kw)
+    except RuntimeError as e:
+        if typ == "blocked" and "bad_type" in str(e):
+            return {"status": "legacy_skip"}
+        if typ in ("gone_cleared", "gone_wait") and "bad_type" in str(e):
+            if typ == "gone_wait":
+                kw = dict(kw)
+                kw.pop("type", None)
+                try:
+                    return bridge("uf_event", type="inactive", **kw)
+                except RuntimeError:
+                    return {"status": "legacy_skip"}
+            return {"status": "legacy_skip"}
+        raise
+
+
+class FollowIndex:
+    """Did → rkey der eigenen Follow-Datensätze, einmal je Lauf per listRecords aufgebaut."""
+
+    def __init__(self, bs: "Bsky"):
+        self.bs = bs
+        self.by_did: dict[str, str] = {}
+        self.complete = False
+        self.loaded = False
+
+    def ensure(self) -> None:
+        if self.loaded:
+            return
+        cursor, seen = "", set()
+        prefix = f"at://{self.bs.did}/app.bsky.graph.follow/"
+        for _ in range(1000):
+            if left() < 25:
+                break
+            q = {"repo": self.bs.did, "collection": "app.bsky.graph.follow", "limit": 100}
+            if cursor:
+                q["cursor"] = cursor
+            d = self.bs.get("com.atproto.repo.listRecords", q)
+            for rec in d.get("records") or []:
+                if not isinstance(rec, dict):
+                    continue
+                val = rec.get("value") or {}
+                subj = val.get("subject") or ""
+                if isinstance(subj, dict):
+                    subj = str(subj.get("did") or "")
+                uri = str(rec.get("uri") or "")
+                subj = str(subj)
+                if not subj or not uri.startswith(prefix):
+                    continue
+                key = uri[len(prefix):]
+                if key and key not in (".", ".."):
+                    self.by_did[subj] = key
+            cursor = d.get("cursor") or ""
+            if not cursor:
+                self.complete = True
+                break
+            if not isinstance(cursor, str) or cursor in seen:
+                break
+            seen.add(cursor)
+        self.loaded = True
+
+    def rkey(self, did: str) -> str | None:
+        self.ensure()
+        return self.by_did.get(did)
 
 
 _DID = re.compile(r"^did:[a-z0-9]+:[A-Za-z0-9._:%-]+$")
@@ -850,6 +979,7 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
     if not pending or READONLY:
         res["pending"] = len(pending); return res
     count = errors = blocked = 0; stopped = ""
+    follows = FollowIndex(bs)
     for row in pending[:10]:
         if left() < 30:
             stopped = "Laufzeitgrenze"; break
@@ -857,44 +987,58 @@ def uf_run(bs: Bsky, uf: dict) -> dict:
         base = {"id": eid, "did": did, "actor": bs.did, "handle": row.get("handle", ""), "display_name": row.get("display_name", "")}
         try:
             st = account_status(did)
+            p = None
+            if st == "active":
+                st, p = profile_status(bs, did)
+            if st in UF_GONE:
+                if uf_gone_ready(row, st):
+                    rkey = follows.rkey(did)
+                    if rkey:
+                        g = uf_bridge("pre_delete", follow_uri=f"at://{bs.did}/app.bsky.graph.follow/{rkey}", reason=UF_GONE_MSG, **base)
+                        if g.get("status") == "day_limit":
+                            stopped = "Tageslimit von 100 Entfolgen-Versuchen erreicht"; break
+                        if g.get("status") != "go":
+                            continue
+                        bs.post("com.atproto.repo.deleteRecord", {"repo": bs.did, "collection": "app.bsky.graph.follow", "rkey": rkey})
+                        uf_bridge("deleted", message=UF_GONE_MSG, reason=UF_GONE_MSG, **base); count += 1
+                    elif follows.complete:
+                        uf_bridge("gone_cleared", message=UF_GONE_NONE, **base)
+                else:
+                    uf_bridge("inactive", account_status=st, **base)
+                continue
             if st != "active":
-                bridge("uf_event", type="inactive", account_status=st, **base); continue
-            prof = (bs.get("app.bsky.actor.getProfiles", "actors=" + urllib.parse.quote(did, safe="")).get("profiles") or [])
-            p = next((x for x in prof if x.get("did") == did), None)
+                uf_bridge("inactive", account_status=st, **base); continue
             if not p or not isinstance(p.get("viewer"), dict):
                 raise RuntimeError("Profilbeziehung nicht sicher prüfbar.")
             v = p["viewer"]
             if v.get("blocking") or v.get("blockedBy") or v.get("blockingByList"):
-                # Blockierung ist kein Fehler: nur notieren und überspringen (bleibt auf der Website zur Ansicht markiert)
+                # Blockierung ist kein Fehler: eigener Status, keine stündliche Wiederholung, keine rote Ampel
                 blocked += 1; log("Entfolgen-Prüfung: blockierte Beziehung übersprungen (kein Fehler).")
-                try:
-                    bridge("uf_event", type="error", **base)
-                except Exception:  # noqa: BLE001
-                    pass
+                uf_bridge("blocked", **base)
                 continue
             base.update(handle=str(p.get("handle") or base["handle"]), display_name=str(p.get("displayName") or base["display_name"]))
             if v.get("followedBy"):
-                bridge("uf_event", type="returned", **base); continue
+                uf_bridge("returned", **base); continue
             if not v.get("following"):
-                bridge("uf_event", type="not_following", **base); continue
-            g = bridge("uf_event", type="pre_delete", follow_uri=str(v["following"]), **base)   # Ausschluss wird VOR dem Löschen gespeichert
+                uf_bridge("not_following", **base); continue
+            g = uf_bridge("pre_delete", follow_uri=str(v["following"]), **base)   # Ausschluss wird VOR dem Löschen gespeichert
             if g.get("status") == "day_limit":
                 stopped = "Tageslimit von 100 Entfolgen-Versuchen erreicht"; break
             if g.get("status") != "go":
                 continue
             bs.post("com.atproto.repo.deleteRecord", {"repo": bs.did, "collection": "app.bsky.graph.follow", "rkey": g["rkey"]})
-            bridge("uf_event", type="deleted", **base); count += 1
+            uf_bridge("deleted", **base); count += 1
         except RateLimit:
             errors += 1
             try:
-                bridge("uf_event", type="error", **base)
+                uf_bridge("error", **base)
             except Exception:  # noqa: BLE001
                 pass
             stopped = "Bluesky-Rate-Limit"; break
         except Exception as e:  # noqa: BLE001
             errors += 1; log(f"Entfolgen-Prüfung Fehler: {str(e)[:120]}")
             try:
-                bridge("uf_event", type="error", **base)
+                uf_bridge("error", **base)
             except Exception:  # noqa: BLE001
                 pass
         time.sleep(0.15)
