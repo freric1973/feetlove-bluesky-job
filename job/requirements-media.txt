@@ -4,3 +4,4 @@ transformers==5.23.0
 sentencepiece==0.2.3
 pillow==13.0.0
 numpy==2.5.4
+# NSFW (Falconsai/nsfw_image_detection), Florence-2-base und opus-mt-en-de laufen über transformers (keine weiteren Pakete).

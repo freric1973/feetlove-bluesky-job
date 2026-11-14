@@ -2,6 +2,7 @@ name: Medien-Index (Bildvorschlag)
 
 # BILDVORSCHLAG-20261114: rechnet Bildvektoren für den Bildvorschlag auf der Tageszahlen-Seite.
 # Nur neue/geänderte Medien werden verarbeitet. Schreibt über media-gh-bridge.php (eigenes Secret).
+# BILDVORSCHLAG-NSFW: zusätzlich NSFW-Score (Falconsai) und eigene Kurzbeschreibung (Florence-2-base → Deutsch).
 on:
   workflow_dispatch:
     inputs:
@@ -11,6 +12,9 @@ on:
       limit:
         description: "Höchstens so viele Medien (0 = alle offenen)"
         default: "0"
+      caption:
+        description: "Eigene Kurzbeschreibung erzeugen (1 = ja, 0 = nur Vektor + NSFW)"
+        default: "1"
   schedule:
     - cron: "17 3 * * 1"   # montags 03:17 UTC (04:17 Berlin Winterzeit), nur neue Uploads
 
@@ -36,7 +40,7 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.cache/huggingface
-          key: media-index-${{ hashFiles('job/requirements-media.txt') }}-xlmr-b32-laion5b
+          key: media-index-${{ hashFiles('job/requirements-media.txt') }}-xlmr-b32-laion5b-falconsai-florence2b-opusmt
       - name: Pakete installieren
         run: |
           python -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch==2.15.0 torchvision==0.29.2
@@ -46,5 +50,6 @@ jobs:
           FL_MEDIA_BRIDGE_URL: ${{ secrets.FL_MEDIA_BRIDGE_URL }}
           FL_MEDIA_BRIDGE_SECRET: ${{ secrets.FL_MEDIA_BRIDGE_SECRET }}
           FL_MAX_MINUTES: ${{ inputs.max_minutes || '40' }}
+          FL_CAPTION: ${{ inputs.caption || '1' }}
           HF_HUB_DISABLE_TELEMETRY: "1"
-        run: python job/fl_media_index.py bridge --threads 2 --fetchers 6 --limit "${{ inputs.limit || '0' }}"
+        run: python job/fl_media_index.py bridge --threads 0 --fetchers 6 --limit "${{ inputs.limit || '0' }}"

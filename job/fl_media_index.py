@@ -10,27 +10,41 @@ Modi
             Umgebung: FL_MEDIA_BRIDGE_URL, FL_MEDIA_BRIDGE_SECRET oder FL_MEDIA_BRIDGE_SECRET_FILE (wird nie ausgegeben).
   bench   – lokaler Test ohne Server: fl_media_index.py bench BILD_ODER_URL … (misst Laufzeit, zeigt Top-Wörter)
 
+Zusätzlich (BILDVORSCHLAG-NSFW):
+  * NSFW-Score je Medium mit Falconsai/nsfw_image_detection (ViT, CPU). Über der Schwelle der Webseite → Ü18 und
+    kein automatisches Bluesky-Posting, bis Dennis im Medienpool freigibt.
+  * Eigene Kurzbeschreibung ohne Inhaltsfilter: Florence-2-base (<CAPTION>) → Zitattext abschneiden → opus-mt-en-de → max. 6 Wörter.
+    Abschalten mit FL_CAPTION=0 (dann nur Vektor + NSFW).
+
 Optionen: --max-minutes N (Zeitbudget, danach sauber aufhören; Rest beim nächsten Lauf), --batch N, --limit N
 """
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import argparse, base64, hashlib, hmac, io, json, os, secrets, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import argparse, base64, hashlib, hmac, io, json, os, re, secrets, subprocess, sys, tempfile, time, urllib.request, urllib.error
 
 MODEL_ARCH = "xlm-roberta-base-ViT-B-32"
 MODEL_PRETRAINED = "laion5b_s13b_b90k"
 MODEL_ID = f"{MODEL_ARCH}/{MODEL_PRETRAINED}"   # muss FL_MS_MODEL in medien-suche-lib.php entsprechen
 DIMS = 512
-TAGS_PER_ITEM = 6
+NSFW_MODEL = "Falconsai/nsfw_image_detection"                 # = FL_MS_NSFW_MODEL
+CAP_MODEL = "florence-community/Florence-2-base"
+MT_MODEL = "Helsinki-NLP/opus-mt-en-de"
+CAP_MAX_WORDS = 6
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 # ---------------------------------------------------------------- Modell
+def set_threads():
+    import torch
+    torch.set_num_threads(int(os.environ.get('FL_THREADS') or 0) or max(1, os.cpu_count() or 1))
+    return torch
+
 class Model:
     def __init__(self):
-        import torch, open_clip
-        torch.set_num_threads(int(os.environ.get('FL_THREADS') or 0) or max(1, os.cpu_count() or 1))
+        import open_clip
+        torch = set_threads()
         t = time.time()
         self.torch = torch
         self.model, _, self.preprocess = open_clip.create_model_and_transforms(MODEL_ARCH, pretrained=MODEL_PRETRAINED)
@@ -132,23 +146,68 @@ class Bridge:
     def file(self, key: str, part: str) -> bytes:
         return self._req({"action": "file", "key": key, "part": part}, raw=True, timeout=300)
 
-# ---------------------------------------------------------------- Tags
-class Tagger:
-    def __init__(self, labels, vecs):
-        import numpy as np
-        self.labels, self.vecs = labels, vecs
-        self.center, self.n = np.zeros(DIMS, dtype="float32"), 0
+# ---------------------------------------------------------------- NSFW + Kurzbeschreibung
+class Nsfw:
+    def __init__(self):
+        from transformers import pipeline
+        set_threads()
+        t = time.time()
+        self.pipe = pipeline("image-classification", model=NSFW_MODEL, device=-1)
+        self.load_s = time.time() - t
 
-    def tags(self, img_vecs):
-        import numpy as np
-        if not len(self.labels):
-            return [[] for _ in img_vecs]
-        for v in img_vecs:                      # laufender Mittelwert der Bilder → typische Allerwelts-Wörter abwerten
-            self.n += 1
-            self.center += (v - self.center) / self.n
-        bias = 0.5 * (self.vecs @ self.center)   # halb abziehen (Test: beste Mischung aus Treffern und Vielfalt)
-        sims = img_vecs @ self.vecs.T - bias[None, :]
-        return [[self.labels[i] for i in np.argsort(-row)[:TAGS_PER_ITEM]] for row in sims]
+    def scores(self, pil_list):
+        out = []
+        for res in self.pipe(pil_list, batch_size=8):
+            out.append(round(float(next((r["score"] for r in res if r["label"].lower() == "nsfw"), 0.0)), 4))
+        return out
+
+_CUT = re.compile(r"\s*(,|\bwith the (words|text|caption|quote)\b|\bthat (says|reads)\b|\bwhich (says|reads)\b|\bsaying\b|\bwritten\b|\bthe words\b|\bthe text\b|[\"\u201c\u201e:]).*$", re.I)
+
+def clean_caption_en(en: str) -> str:
+    """Zitierten Bildtext abschneiden (der steht schon in den Gemini-Feldern bzw. ist keine Stimmung)."""
+    en = re.sub(r"\s+", " ", en or "").strip()
+    en = re.sub(r"^(this is |there is |an image of |a picture of |a photo of )", "", en, flags=re.I)
+    cut = _CUT.sub("", en).strip(" .,-")
+    return cut if len(cut.split()) >= 2 else en.split(",")[0].strip(" .,-")
+
+_DE_STOP = {"mit", "auf", "an", "in", "im", "vor", "von", "vom", "zu", "zum", "zur", "und", "oder", "ein", "eine", "einem", "einer", "einen", "eines",
+            "der", "die", "das", "den", "dem", "des", "die", "sich", "neben", "über", "unter", "hinter", "bei", "für", "aus", "nach"}
+
+def short_de(de: str) -> str:
+    de = re.sub(r"\s+", " ", de or "").strip(" .,;:-\"'„“")
+    de = re.sub(r"^(ein|eine|einer|einem|einen|der|die|das)\s+", "", de, flags=re.I)
+    w = de.split(" ")
+    cut = len(w) > CAP_MAX_WORDS
+    w = w[:CAP_MAX_WORDS]
+    while cut and len(w) > 2 and w[-1].lower().strip(",") in _DE_STOP:   # nicht auf „mit einem…“ enden
+        w.pop()
+    de = " ".join(w).rstrip(",") + ("…" if cut else "")
+    return (de[:1].upper() + de[1:])[:120]
+
+class Captioner:
+    def __init__(self):
+        torch = set_threads()
+        from transformers import AutoProcessor, Florence2ForConditionalGeneration, MarianMTModel, MarianTokenizer
+        t = time.time()
+        self.torch = torch
+        self.proc = AutoProcessor.from_pretrained(CAP_MODEL)
+        self.model = Florence2ForConditionalGeneration.from_pretrained(CAP_MODEL).eval()
+        self.tok = MarianTokenizer.from_pretrained(MT_MODEL)
+        self.mt = MarianMTModel.from_pretrained(MT_MODEL).eval()
+        self.load_s = time.time() - t
+
+    def captions(self, pil_list):
+        """→ (deutsch kurz, englisch roh) je Bild"""
+        ens = []
+        with self.torch.no_grad():
+            for im in pil_list:   # einzeln: Florence-Batches bringen auf CPU kaum etwas und kosten RAM
+                inp = self.proc(text="<CAPTION>", images=im, return_tensors="pt")
+                out = self.model.generate(**inp, max_new_tokens=24, num_beams=1, do_sample=False)
+                ens.append(self.proc.batch_decode(out, skip_special_tokens=True)[0])
+            short = [clean_caption_en(e) for e in ens]
+            enc = self.tok(short, return_tensors="pt", padding=True, truncation=True, max_length=64)
+            de = self.tok.batch_decode(self.mt.generate(**enc, max_new_tokens=32), skip_special_tokens=True)
+        return [short_de(d) for d in de], ens
 
 # ---------------------------------------------------------------- Läufe
 def run_bridge(a):
@@ -178,17 +237,28 @@ def run_bridge(a):
         log(f"Modell passt nicht zur Webseite ({lst.get('model')}) – Abbruch.")
         return 2
     items = lst["items"]
-    todo = [i for i in items if not i.get("done")]
+    use_cap = os.environ.get("FL_CAPTION", "1") != "0"
+    for it in items:                       # ältere Webseite ohne "need" → nur Vektor
+        it["need"] = [n for n in it.get("need", [] if it.get("done") else ["vec"]) if use_cap or n != "cap"]
+    todo = [i for i in items if i["need"]]
     if a.limit:
         todo = todo[: a.limit]
     voc = br.call("vocab", all=False)
     words = voc.get("todo", [])
-    log(f"Medien gesamt {len(items)}, offen {len(todo)} · Wortliste {voc.get('total')}, offen {len(words)}")
+    cnt = {n: sum(1 for i in todo if n in i["need"]) for n in ("vec", "nsfw", "cap")}
+    log(f"Medien gesamt {len(items)}, offen {len(todo)} (Vektor {cnt['vec']}, NSFW {cnt['nsfw']}, Beschreibung {cnt['cap']}) · Wortliste {voc.get('total')}, offen {len(words)}")
     if not todo and not words:
         log("Nichts zu tun.")
         return 0
-    model = Model()
-    log(f"Modell geladen in {model.load_s:.1f} s")
+    model = Model() if (words or cnt["vec"]) else None
+    if model:
+        log(f"CLIP geladen in {model.load_s:.1f} s")
+    nsfw = Nsfw() if cnt["nsfw"] else None
+    if nsfw:
+        log(f"NSFW-Modell geladen in {nsfw.load_s:.1f} s")
+    cap = Captioner() if cnt["cap"] else None
+    if cap:
+        log(f"Florence-2 + Übersetzer geladen in {cap.load_s:.1f} s")
     if words:
         vecs = model.texts([w["label"] for w in words])
         rows = [{"key": w["key"], **dict(zip(("vec", "scale"), quantize(v)))} for w, v in zip(words, vecs)]
@@ -196,16 +266,11 @@ def run_bridge(a):
         for i in range(0, len(rows), 300):
             saved += br.call("vocab_save", words=rows[i:i + 300]).get("saved", 0)
         log(f"Wortliste: {len(words)} neue Wörter berechnet, {saved} gespeichert (gesamt {voc.get('total')})")
-    allv = br.call("vocab", all=True).get("vectors", [])
-    labels = [w["label"] for w in allv]
-    mat = np.stack([np.frombuffer(base64.b64decode(w["vec"]), dtype="int8").astype("float32") * float(w["scale"]) for w in allv]) if allv else np.zeros((0, DIMS), dtype="float32")
-    if len(mat):
-        mat = mat / np.linalg.norm(mat, axis=1, keepdims=True)
-    tagger = Tagger(labels, mat)
 
-    done = errs = 0
+    done = errs = flagged = 0
     deadline = t0 + a.max_minutes * 60
-    img_s = 0.0
+    tm = {"vec": 0.0, "nsfw": 0.0, "cap": 0.0}
+    nm = {"vec": 0, "nsfw": 0, "cap": 0}
     for start in range(0, len(todo), a.batch):
         if time.time() > deadline:
             log(f"Zeitbudget {a.max_minutes} Min. erreicht – Rest beim nächsten Lauf.")
@@ -229,21 +294,41 @@ def run_bridge(a):
                 except Exception as e:  # einzelnes Medium kaputt → Fehler vermerken, weiter
                     errs += 1
                     out.append({"key": it["key"], "sig": it["sig"], "error": f"{type(e).__name__}: {str(e)[:150]}"})
-        if pils:
+        rows = {it["key"]: {"key": it["key"], "sig": it["sig"]} for it in ok}
+        for part, fn in (("vec", None), ("nsfw", None), ("cap", None)):
+            sel = [(it, im) for it, im in zip(ok, pils) if part in it["need"]]
+            if not sel:
+                continue
             t = time.time()
-            vecs = model.images(pils)
-            img_s += time.time() - t
-            for it, v, tg in zip(ok, vecs, tagger.tags(vecs)):
-                b64, scale = quantize(v)
-                out.append({"key": it["key"], "sig": it["sig"], "vec": b64, "scale": scale, "tags": tg})
-            done += len(ok)
+            try:
+                if part == "vec":
+                    for (it, _), v in zip(sel, model.images([im for _, im in sel])):
+                        b64, scale = quantize(v)
+                        rows[it["key"]].update(vec=b64, scale=scale)
+                elif part == "nsfw":
+                    for (it, _), sc in zip(sel, nsfw.scores([im for _, im in sel])):
+                        rows[it["key"]]["nsfw"] = sc
+                        flagged += sc >= 0.5
+                else:
+                    de, _ = cap.captions([im for _, im in sel])
+                    for (it, _), d in zip(sel, de):
+                        rows[it["key"]]["caption"] = d
+            except Exception as e:      # Teil fehlgeschlagen → Rest trotzdem speichern
+                for it, _ in sel:
+                    rows[it["key"]]["error"] = f"{part}: {type(e).__name__}: {str(e)[:120]}"
+            tm[part] += time.time() - t
+            nm[part] += len(sel)
+        out.extend(rows.values())
+        done += len(ok)
         if out:
             r = br.call("save", items=out)
             if r.get("rejected"):
                 log(f"Warnung: {r['rejected']} Einträge abgelehnt")
         log(f"{min(start + a.batch, len(todo))}/{len(todo)} verarbeitet")
     st = br.call("stats")
-    log(f"Fertig: {done} neu, {errs} Fehler, Modellzeit {img_s:.1f} s ({(img_s / done if done else 0):.3f} s/Bild), gesamt {time.time() - t0:.0f} s · Webseite: {st.get('indexed')}/{st.get('items')} indexiert")
+    per = " · ".join(f"{k} {tm[k]:.1f} s ({(tm[k] / nm[k] if nm[k] else 0):.3f} s/Bild)" for k in ("vec", "nsfw", "cap"))
+    log(f"Fertig: {done} neu, {errs} Fehler, NSFW-Verdacht {flagged} · Modellzeit {per} · gesamt {time.time() - t0:.0f} s · "
+        f"Webseite: {st.get('indexed')}/{st.get('items')} indexiert, NSFW geprüft {st.get('nsfw_checked')}, Verdacht {st.get('nsfw_flagged')}, Beschreibungen {st.get('captions')}")
     return 0
 
 def run_bench(a):
@@ -283,6 +368,16 @@ def run_bench(a):
     res = {"bilder": len(pils), "modell_laden_s": round(model.load_s, 1), "download_s": round(dl, 2), "download_s_pro_bild": round(dl / len(pils), 3), "fetchers": a.fetchers, "modell_s": round(img_s, 2),
            "s_pro_bild": round(img_s / len(pils), 3), "int8_fehler_max": round(err, 4), "threads": model.torch.get_num_threads(),
            "gesamt_s": round(time.time() - t0, 1)}
+    if os.environ.get("FL_BENCH_EXTRA", "1") != "0":
+        nz = Nsfw(); nz.scores(pils[:1])
+        t = time.time(); sc = nz.scores(pils); ns = time.time() - t
+        cp = Captioner(); cp.captions(pils[:1])
+        t = time.time(); de, en = cp.captions(pils); cs = time.time() - t
+        for n, s_, d, e in zip(names, sc, de, en):
+            log(f"{n[:40]:40s} nsfw {s_:.4f} | {d} | {e[:70]}")
+        res.update({"nsfw_laden_s": round(nz.load_s, 1), "nsfw_s_pro_bild": round(ns / len(pils), 3),
+                    "caption_laden_s": round(cp.load_s, 1), "caption_s_pro_bild": round(cs / len(pils), 3),
+                    "gesamt_s": round(time.time() - t0, 1)})
     print(json.dumps(res, ensure_ascii=False))
     return 0
 
