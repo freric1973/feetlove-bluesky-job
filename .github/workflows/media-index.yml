@@ -8,7 +8,7 @@ on:
     inputs:
       max_minutes:
         description: "Zeitbudget in Minuten (Rest beim nächsten Lauf)"
-        default: "40"
+        default: "330"
       limit:
         description: "Höchstens so viele Medien (0 = alle offenen)"
         default: "0"
@@ -28,7 +28,7 @@ concurrency:
 jobs:
   index:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
