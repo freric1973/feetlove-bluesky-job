@@ -103,21 +103,52 @@ def http(url: str, headers: dict | None = None, body: bytes | None = None, timeo
 
 # ---------------- Schnittstelle (one.com) ----------------
 
+class BridgeUnreachable(RuntimeError):
+    pass
+
+
+_IPV4_ONLY = False
+
+
+def _force_ipv4() -> None:
+    # Fallback: nur noch IPv4-Adressen verwenden (GitHub-Rechner haben teils kein IPv6-Netz)
+    global _IPV4_ONLY
+    if _IPV4_ONLY:
+        return
+    _IPV4_ONLY = True
+    import socket
+    orig = socket.getaddrinfo
+
+    def v4(host, port, family=0, type=0, proto=0, flags=0):
+        return orig(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = v4  # type: ignore[assignment]
+
+
 def bridge(action: str, **data) -> dict:
     body = json.dumps({"action": action, "run": RUN_ID, **data}, ensure_ascii=False, separators=(",", ":")).encode()
-    ts, nonce = str(int(time.time())), secrets.token_urlsafe(18)
-    sig = hmac.new(BRIDGE_SECRET.encode(), ts.encode() + b"\n" + nonce.encode() + b"\n" + body, hashlib.sha256).hexdigest()
-    hdr = {"Content-Type": "application/json", "X-FL-Time": ts, "X-FL-Nonce": nonce, "X-FL-Sig": sig, "User-Agent": "feetlove-gh-bluesky/1"}
-    req = urllib.request.Request(BRIDGE_URL, data=body, headers=hdr, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=90) as r:
-            d = json.loads(r.read() or b"{}")
-    except urllib.error.HTTPError as e:
+    waits = [5, 15, 30]
+    for attempt in range(len(waits) + 1):
+        ts, nonce = str(int(time.time())), secrets.token_urlsafe(18)
+        sig = hmac.new(BRIDGE_SECRET.encode(), ts.encode() + b"\n" + nonce.encode() + b"\n" + body, hashlib.sha256).hexdigest()
+        hdr = {"Content-Type": "application/json", "X-FL-Time": ts, "X-FL-Nonce": nonce, "X-FL-Sig": sig, "User-Agent": "feetlove-gh-bluesky/1"}
+        req = urllib.request.Request(BRIDGE_URL, data=body, headers=hdr, method="POST")
         try:
-            d = json.loads(e.read() or b"{}")
-        except ValueError:
-            d = {}
-        raise RuntimeError(f"Schnittstelle {action}: HTTP {e.code} {d.get('status', '')} {d.get('message', '')}".strip())
+            with urllib.request.urlopen(req, timeout=90) as r:
+                d = json.loads(r.read() or b"{}")
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                d = json.loads(e.read() or b"{}")
+            except ValueError:
+                d = {}
+            raise RuntimeError(f"Schnittstelle {action}: HTTP {e.code} {d.get('status', '')} {d.get('message', '')}".strip())
+        except urllib.error.URLError as e:
+            # Verbindung kam gar nicht zustande -> Anfrage hat die Seite nicht erreicht, Wiederholen ist sicher
+            if attempt >= len(waits):
+                raise BridgeUnreachable(f"Webseite nicht erreichbar ({action}): {e.reason}")
+            log(f"Webseite nicht erreichbar ({e.reason}), neuer Versuch in {waits[attempt]} s" + ("" if _IPV4_ONLY else " über IPv4"))
+            _force_ipv4()
+            time.sleep(waits[attempt])
     if not d.get("ok"):
         raise RuntimeError(f"Schnittstelle {action}: {d.get('status')} {d.get('message', '')}".strip())
     return d
@@ -868,7 +899,11 @@ def main() -> int:
     if missing:
         log("Fehlende Secrets: " + ", ".join(missing)); return 2
     log(f"Lauf {RUN_ID} startet (readonly={READONLY})")
-    st = bridge("begin")
+    try:
+        st = bridge("begin")
+    except BridgeUnreachable as e:
+        log(f"Hinweis (kein Fehler): {e}. Lauf ausgelassen, der nächste Anstoß holt alles nach.")
+        return 0
     if st.get("status") != "ready":
         log(f"Kein Lauf: {st.get('status')} {st.get('reason', '')}"); return 0
     XAI_MODEL = st.get("xai_model") or XAI_MODEL
