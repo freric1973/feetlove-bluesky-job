@@ -17,6 +17,7 @@ Zusätzlich (BILDVORSCHLAG-NSFW):
     Abschalten mit FL_CAPTION=0 (dann nur Vektor + NSFW).
 
 Optionen: --max-minutes N (Zeitbudget, danach sauber aufhören; Rest beim nächsten Lauf), --batch N, --limit N
+Verbindungen zur Webseite immer über IPv4 (wie der Bluesky-Job), kurze Timeouts, bei Aussetzern Wiederholen.
 """
 from __future__ import annotations
 
@@ -107,13 +108,39 @@ def video_frame(data: bytes) -> bytes:
     raise RuntimeError("Kein Standbild aus dem Video")
 
 # ---------------------------------------------------------------- Bridge
+# IPv4-Zwang wie in fl_bluesky.py (Commit 3c17a65): GitHub-Runner lösen one.com oft
+# zuerst über IPv6 auf; die Verbindung hängt dann bis zum Socket-Timeout, erst danach
+# kommt IPv4 dran. Beim Bluesky-Job waren das 90 s je Anfrage (Log: "Network is
+# unreachable" nach genau 90 s, bzw. erfolgreicher Lauf erst nach 90 s). Hier wäre
+# das 300 s je Bild-Download – bei 6 parallelen Fetcher und Batch 16 also ~3 Wellen
+# à Timeout, passend zu den beobachteten ~8–14 Min. je 16 Medien.
+_IPV4_ONLY = False
+BRIDGE_TIMEOUT = 20   # list/save/stats/vocab
+FILE_TIMEOUT = 60     # Datei; einmal verbunden reicht das, auch für größere Videos
+_RETRY_WAITS = (2, 5, 10)
+
+
+def _force_ipv4() -> None:
+    global _IPV4_ONLY
+    if _IPV4_ONLY:
+        return
+    _IPV4_ONLY = True
+    import socket
+    orig = socket.getaddrinfo
+
+    def v4(host, port, family=0, type=0, proto=0, flags=0):
+        return orig(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = v4  # type: ignore[assignment]
+
+
 class Bridge:
     def __init__(self, url: str, secret: str):
         self.url, self._secret = url, secret.encode()
 
-    def _req(self, payload: dict, raw: bool = False, timeout: int = 120):
+    def _req(self, payload: dict, raw: bool = False, timeout: int = BRIDGE_TIMEOUT):
         last = None
-        for attempt in range(4):
+        tries = len(_RETRY_WAITS) + 1
+        for attempt in range(tries):
             try:
                 with urllib.request.urlopen(self._resign(payload), timeout=timeout) as r:
                     data = r.read()
@@ -127,10 +154,20 @@ class Bridge:
                 if e.code in (400, 403, 404, 413):
                     raise RuntimeError(f"Bridge HTTP {e.code}") from None
                 last = e
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
+                # Verbindung kam nicht zustande oder hing (typisch IPv6 auf GitHub).
                 last = e
-            time.sleep(3 * (attempt + 1))
-        raise RuntimeError(f"Bridge nicht erreichbar: {type(last).__name__}")
+                if attempt < len(_RETRY_WAITS):
+                    wait = _RETRY_WAITS[attempt]
+                    reason = getattr(e, "reason", e)
+                    log(f"Webseite nicht erreichbar ({reason}), neuer Versuch in {wait} s"
+                        + ("" if _IPV4_ONLY else " über IPv4"))
+                    _force_ipv4()
+                    time.sleep(wait)
+                    continue
+            if attempt < len(_RETRY_WAITS):
+                time.sleep(_RETRY_WAITS[attempt])
+        raise RuntimeError(f"Bridge nicht erreichbar: {type(last).__name__}: {last}")
 
     def _resign(self, payload):
         body = json.dumps(payload, separators=(",", ":")).encode()
@@ -144,7 +181,7 @@ class Bridge:
         return self._req({"action": action, "model": MODEL_ID, **kw})
 
     def file(self, key: str, part: str) -> bytes:
-        return self._req({"action": "file", "key": key, "part": part}, raw=True, timeout=300)
+        return self._req({"action": "file", "key": key, "part": part}, raw=True, timeout=FILE_TIMEOUT)
 
 # ---------------------------------------------------------------- NSFW + Kurzbeschreibung
 class Nsfw:
@@ -222,6 +259,8 @@ def run_bridge(a):
         return 2
     br = Bridge(url, secret)
     t0 = time.time()
+    _force_ipv4()
+    log("Verbindungen zur Webseite über IPv4.")
     try:
         lst = br.call("list")
     except RuntimeError as e:
