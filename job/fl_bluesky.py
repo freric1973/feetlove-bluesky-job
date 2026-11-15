@@ -35,7 +35,13 @@ MAX_RUNTIME = float(ENV("FL_MAX_RUNTIME", "420"))   # Sicherheitsgrenze je Lauf 
 SLEEP_LIKE = float(ENV("FL_SLEEP_LIKE", "0.7"))
 LIKES_BUDGET = float(ENV("FL_LIKES_BUDGET", "240"))  # Auto-Likes enden spätestens nach X s, wenn der Abgleich fällig ist
 FINISH_RESERVE = float(ENV("FL_FINISH_RESERVE", "25"))  # Rest für Abschluss-Meldung an die Seite
-AF_BUDGET = float(ENV("FL_AF_BUDGET", "90"))        # festes Zeitfenster für Auto-Folgen am Laufende
+AF_BUDGET = float(ENV("FL_AF_BUDGET", "120"))       # Mindest-Zeitfenster für Auto-Folgen am Laufende (ALLELIKES: 90 -> 120 s)
+# ALLELIKES-20261115: Vorgabe "Wer mir einen Like gegeben hat und dem ich nicht folge, wird gefolgt – bei jedem Beitrag".
+AF_BACKFILL_POSTS = int(ENV("FL_AF_BACKFILL_POSTS", "150"))     # ältere Posts (außerhalb autofollow_days) je Lauf
+AF_BACKFILL_RESERVE = float(ENV("FL_AF_BACKFILL_RESERVE", "50"))  # so viele Sekunden bleiben für Profile + Folgen
+AF_VERIFY_MAX = int(ENV("FL_AF_VERIFY_MAX", "300"))             # bekannte Liker (followed/skipped) live nachprüfen je Lauf
+AF_VERIFY_RECENT_H = int(ENV("FL_AF_VERIFY_RECENT_H", "48"))    # Likes der letzten X Stunden immer zuerst prüfen
+AF_QUEUE_MAX = int(ENV("FL_AF_QUEUE_MAX", "300"))               # Rückstand je Lauf höchstens so viele Zeilen merken
 SLEEP_AF = float(ENV("FL_SLEEP_AF", "0.15"))        # Pause zwischen getLikes-/Profil-Seiten
 SLEEP_FOLLOW = float(ENV("FL_SLEEP_FOLLOW", "1.5"))  # Pause zwischen Follows (wie PHP usleep 1.5s)
 AF_LOCK_RETRIES = max(1, int(ENV("FL_AF_LOCK_RETRIES", "4")))  # af_save-Versuche bei HTTP 409 af_locked
@@ -1140,6 +1146,34 @@ def af_cache_stale(cache: dict, uri: str, count: int, max_age: int = 21600) -> b
     return int(row[0]) != count or time.time() - int(row[1]) > max_age
 
 
+AF_BF_KEY = "__backfill__"   # Fortschritt der Alt-Post-Runde im Auto-Folgen-Cache
+AF_VF_KEY = "__verify__"     # Rotations-Cursor der Nachprüfung bekannter Liker
+
+
+def af_state(cache: dict, key: str) -> dict:
+    v = cache.get(key)
+    return dict(v) if isinstance(v, dict) else {}
+
+
+def af_feed_post_ok(item: dict, me: str) -> dict | None:
+    p = item.get("post") or {}
+    if (p.get("author") or {}).get("did") != me or item.get("reason"):
+        return None
+    return p
+
+
+def af_verify_order(cands: dict, like_ts: dict, after: str, recent_h: int, now: float | None = None) -> list[str]:
+    """Erst Likes der letzten recent_h Stunden (neueste zuerst), dann alle übrigen rotierend ab Cursor 'after'."""
+    now = time.time() if now is None else now
+    lim = now - recent_h * 3600
+    recent = [d for d in cands if float(like_ts.get(d) or 0) >= lim]
+    recent.sort(key=lambda d: float(like_ts.get(d) or 0), reverse=True)
+    rs = set(recent)
+    rest = sorted(d for d in cands if d not in rs)
+    rest = [d for d in rest if d > after] + [d for d in rest if d <= after]
+    return recent + rest
+
+
 def af_profiles(bs: Bsky, dids: list[str]) -> dict:
     out = {}
     uniq = [d for d in dict.fromkeys(dids) if d and _DID_AF.match(d)]
@@ -1337,6 +1371,11 @@ class AutoFollow:
         self.reunfollowed = set(str(x) for x in (self.af.get("reunfollowed") or []))
         self.created = {str(k): str(v or "") for k, v in (self.af.get("created_at") or {}).items()}
         self.uris = {str(k): str(v or "") for k, v in (self.af.get("source_uris") or {}).items()}
+        # ALLELIKES: von Hand übersprungene Konten (Tageszahlen) bleiben ausgenommen. Ältere Bridge ohne Liste ->
+        # skipped-Zeilen gar nicht nachprüfen (sicher), nur followed.
+        ms = self.af.get("manual_skip")
+        self.manual_skip: set[str] | None = set(str(x) for x in ms) if isinstance(ms, list) else None
+        self.like_ts: dict[str, float] = {}   # did -> jüngster Like (Unix-Zeit)
         self.cache_new: dict | None = None
         self.new_cursor: str | None = None
         self.stats: dict = {"ok": True, "dryrun": self.dry, "posts": 0, "likers": 0, "followed": 0,
@@ -1378,6 +1417,135 @@ class AutoFollow:
                   "avatar_url": str(p.get("avatar") or ""), "source_post_uri": src, "status": status,
                   "reason": reason, "follow_uri": follow_uri, "followed_now": followed_now})
         self.known[did] = status
+
+    def post_likers(self, uri: str, likers: dict, liked_recent: dict) -> tuple[bool, bool]:
+        """Alle Liker eines Posts (Pagination, max. 20 Seiten à 100). Rückgabe (vollständig, Zeitgrenze)."""
+        st = self.stats
+        cursor, pages = None, 0
+        while True:
+            if left() < 8:
+                return False, True
+            q = {"uri": uri, "limit": 100}
+            if cursor:
+                q["cursor"] = cursor
+            try:
+                d = self.bs.get("app.bsky.feed.getLikes", q)
+            except RateLimit:
+                raise
+            except Exception as e:  # noqa: BLE001
+                if "RATE_LIMIT" in str(e):
+                    raise RateLimit() from e
+                af_err(st, str(e))
+                return False, False
+            for lk in d.get("likes") or []:
+                actor = (lk or {}).get("actor") or {}
+                did = str(actor.get("did") or "")
+                if not did or did == self.bs.did:
+                    continue
+                if did not in likers:
+                    likers[did] = uri
+                lt = af_like_time(lk)
+                if lt is not None and lt.timestamp() > self.like_ts.get(did, 0.0):
+                    self.like_ts[did] = lt.timestamp()
+                if did not in liked_recent and af_liked_since_return_cutoff(lt):
+                    liked_recent[did] = uri
+            cursor = d.get("cursor")
+            pages += 1
+            if SLEEP_AF:
+                time.sleep(SLEEP_AF)
+            if not cursor or pages >= 20:
+                return True, False
+
+    def backfill(self, likers: dict, liked_recent: dict) -> None:
+        """ALLELIKES: ältere Posts außerhalb des autofollow_days-Fensters in Scheiben je Lauf (Cursor + Position im Cache),
+        damit über mehrere Läufe JEDER Beitrag erfasst wird. Danach beginnt die Runde von vorn (neue Likes auf alten Posts)."""
+        st = self.stats
+        bf = af_state(self.cache, AF_BF_KEY)
+        cursor = str(bf.get("cursor") or "")
+        skip = int(bf.get("skip") or 0)
+        cutoff = time.time() - self.days * 86400
+        calls = 0
+        done_posts = 0
+        while calls < AF_BACKFILL_POSTS and left() > AF_BACKFILL_RESERVE:
+            q = {"actor": self.bs.did, "limit": 100, "filter": "posts_and_author_threads"}
+            if cursor:
+                q["cursor"] = cursor
+            d = self.bs.get("app.bsky.feed.getAuthorFeed", q)
+            feed = d.get("feed") or []
+            stopped_at = -1
+            for idx, item in enumerate(feed):
+                if idx < skip:
+                    continue
+                p = af_feed_post_ok(item, self.bs.did)
+                if p is None:
+                    continue
+                lc = int(p.get("likeCount") or 0)
+                uri = str(p.get("uri") or "")
+                pt = ts(str((p.get("record") or {}).get("createdAt") or "")) or 0
+                if lc == 0 or not uri or pt >= cutoff:
+                    continue   # ohne Likes oder schon im Fenster der letzten Tage erfasst
+                if calls >= AF_BACKFILL_POSTS or left() <= AF_BACKFILL_RESERVE:
+                    stopped_at = idx
+                    break
+                calls += 1
+                ok, cut = self.post_likers(uri, likers, liked_recent)
+                if not ok:
+                    stopped_at = idx
+                    if cut:
+                        st["time_limit"] = True
+                    break
+                done_posts += 1
+            if stopped_at >= 0:
+                skip = stopped_at          # selbe Seite, ab diesem Post weiter
+                break
+            nxt = d.get("cursor")
+            skip = 0
+            if not nxt or not feed:
+                cursor = ""
+                bf["pass"] = int(bf.get("pass") or 0) + 1
+                bf["pass_done_at"] = int(time.time())
+                bf["pass_posts"] = int(bf.get("pass_posts_run") or 0) + done_posts
+                bf["pass_posts_run"] = 0
+                done_posts = 0
+                break
+            cursor = nxt
+        bf["cursor"] = cursor
+        bf["skip"] = skip
+        bf["pass_posts_run"] = int(bf.get("pass_posts_run") or 0) + done_posts
+        self.bf_state = bf
+        st["backfill"] = {"posts": calls, "pass": int(bf.get("pass") or 0), "pass_posts": int(bf.get("pass_posts_run") or 0)}
+
+    def verify_known(self, likers: dict, todo: dict, profiles: dict) -> None:
+        """ALLELIKES: Liker mit Zeile followed/skipped live prüfen. Folgt dailyfun ihnen nicht (mehr), kommen sie in todo.
+        Ausgenommen: von Hand übersprungen, blocked (Entfolger, von dir entfolgt), Kapazitätszeilen (schon in pending)."""
+        st = self.stats
+        cands = {}
+        for did, src in likers.items():
+            if did in todo:
+                continue
+            prev = self.known.get(did)
+            if prev == "followed" or (prev == "skipped" and self.manual_skip is not None and did not in self.manual_skip):
+                cands[did] = src
+        if not cands or AF_VERIFY_MAX <= 0 or left() < AF_BACKFILL_RESERVE / 2:
+            return
+        vf = af_state(self.cache, AF_VF_KEY)
+        order = af_verify_order(cands, self.like_ts, str(vf.get("after") or ""), AF_VERIFY_RECENT_H)[:AF_VERIFY_MAX]
+        pp = af_profiles(self.bs, order)
+        n_new = 0
+        for did in order:
+            p = pp.get(did)
+            if not p:
+                continue
+            profiles[did] = p
+            if not (p.get("viewer") or {}).get("following"):
+                todo[did] = cands[did]
+                n_new += 1
+        rest = [d for d in order if float(self.like_ts.get(d) or 0) < time.time() - AF_VERIFY_RECENT_H * 3600]
+        if rest:
+            vf["after"] = max(rest)
+        self.vf_state = vf
+        st["verified"] = len(order)
+        st["verify_not_following"] = n_new
 
     def run(self) -> dict:
         st = self.stats
@@ -1433,40 +1601,17 @@ class AutoFollow:
                     time_limit = True
                     break
                 st["posts"] += 1
-                cursor, pages, ok_post = None, 0, True
-                while True:
-                    if left() < 8:
-                        time_limit = True
-                        ok_post = False
-                        break
-                    q = {"uri": uri, "limit": 100}
-                    if cursor:
-                        q["cursor"] = cursor
-                    try:
-                        d = self.bs.get("app.bsky.feed.getLikes", q)
-                    except RateLimit:
-                        raise
-                    except Exception as e:  # noqa: BLE001
-                        if "RATE_LIMIT" in str(e):
-                            raise RateLimit() from e
-                        af_err(st, str(e))
-                        ok_post = False
-                        break
-                    for lk in d.get("likes") or []:
-                        actor = (lk or {}).get("actor") or {}
-                        did = str(actor.get("did") or "")
-                        if did and did != self.bs.did and did not in likers:
-                            likers[did] = uri
-                        if did and did != self.bs.did and did not in liked_recent and af_liked_since_return_cutoff(af_like_time(lk)):
-                            liked_recent[did] = uri
-                    cursor = d.get("cursor")
-                    pages += 1
-                    if SLEEP_AF:
-                        time.sleep(SLEEP_AF)
-                    if not cursor or pages >= 20:
-                        break
+                ok_post, cut = self.post_likers(uri, likers, liked_recent)
+                if cut:
+                    time_limit = True
                 if ok_post:
                     new_cache[uri] = [lc, int(time.time())]
+            recent_likers = dict(likers)
+            bf_likers: dict[str, str] = {}
+            self.bf_state = af_state(self.cache, AF_BF_KEY)
+            self.vf_state = af_state(self.cache, AF_VF_KEY)
+            if not time_limit:
+                self.backfill(bf_likers, liked_recent)
             if time_limit:
                 st["time_limit"] = True
                 merged = {**self.cache, **new_cache}
@@ -1479,12 +1624,19 @@ class AutoFollow:
                 for did, src in self.pending.items():
                     todo[did] = src
                 st["pending"] = len(self.pending)
-            for did, src in likers.items():
-                if did in todo:
-                    continue
-                prev = self.known.get(did)
-                if prev is None or (prev == "would_follow" and not self.dry) or af_is_reunfollowed_candidate(prev, did, self.reunfollowed, self.reunfollowed_active):
-                    todo[did] = src
+            def take_new(src_map: dict) -> None:
+                for did, src in src_map.items():
+                    if did in todo:
+                        continue
+                    prev = self.known.get(did)
+                    if prev is None or (prev == "would_follow" and not self.dry) or af_is_reunfollowed_candidate(prev, did, self.reunfollowed, self.reunfollowed_active):
+                        todo[did] = src
+            take_new(recent_likers)
+            pre_profiles: dict = {}
+            all_likers = {**bf_likers, **recent_likers}
+            self.verify_known(all_likers, todo, pre_profiles)
+            take_new(bf_likers)
+            likers = all_likers
             # Frühere Entfolger in rotierenden Stapeln. Ab 2026-11-14 22:00 Europe/Berlin
             # neue Warteschlangen-Zeilen nur bei Like oder Post-URI; Bestand vor dem Stichtag bleibt.
             return_dids = sorted(self.excluded)
@@ -1510,7 +1662,8 @@ class AutoFollow:
                 if not self.dry:
                     self.new_cursor = batch[-1]
             st["likers"] = len(likers)
-            profiles = af_profiles(self.bs, list(todo.keys())) if todo else {}
+            missing = [d for d in todo if d not in pre_profiles]
+            profiles = {**pre_profiles, **(af_profiles(self.bs, missing) if missing else {})}
             leftover_reason = ""
             for did, src in todo.items():
                 p = profiles.get(did)
@@ -1561,10 +1714,13 @@ class AutoFollow:
                     st["would_follow"] += 1
                     # restliche ebenfalls merken, damit die Tageszahlen-Liste sie zeigt
                     idx = list(todo.keys()).index(did)
-                    for rest_did in list(todo.keys())[idx + 1:]:
+                    rest_all = list(todo.keys())[idx + 1:]
+                    # ALLELIKES: Rückstand gedrosselt merken; Rest findet der nächste Lauf/die nächste Runde wieder
+                    for rest_did in rest_all[:AF_QUEUE_MAX]:
                         rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
                         self.save(rest_did, rp, todo[rest_did], "would_follow", leftover_reason)
                         st["would_follow"] += 1
+                    st["backlog"] = 1 + len(rest_all)
                     break
                 if left() < 8:
                     st["time_limit"] = True
@@ -1572,10 +1728,13 @@ class AutoFollow:
                     self.save(did, p, src, "would_follow", leftover_reason)
                     st["would_follow"] += 1
                     idx = list(todo.keys()).index(did)
-                    for rest_did in list(todo.keys())[idx + 1:]:
+                    rest_all = list(todo.keys())[idx + 1:]
+                    # ALLELIKES: Rückstand gedrosselt merken; Rest findet der nächste Lauf/die nächste Runde wieder
+                    for rest_did in rest_all[:AF_QUEUE_MAX]:
                         rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
                         self.save(rest_did, rp, todo[rest_did], "would_follow", leftover_reason)
                         st["would_follow"] += 1
+                    st["backlog"] = 1 + len(rest_all)
                     break
                 try:
                     fu = af_follow(self.bs, did)
@@ -1608,6 +1767,13 @@ class AutoFollow:
                 st["ok"] = False
                 st["errors"].append(str(e)[:300])
         finally:
+            if self.cache_new is not None:
+                bfs = getattr(self, "bf_state", None)
+                vfs = getattr(self, "vf_state", None)
+                if isinstance(bfs, dict):
+                    self.cache_new[AF_BF_KEY] = bfs
+                if isinstance(vfs, dict):
+                    self.cache_new[AF_VF_KEY] = vfs
             try:
                 self.flush()
             except Exception as e:  # noqa: BLE001
