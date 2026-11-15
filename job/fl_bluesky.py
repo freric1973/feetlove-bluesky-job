@@ -1148,6 +1148,8 @@ def af_cache_stale(cache: dict, uri: str, count: int, max_age: int = 21600) -> b
 
 AF_BF_KEY = "__backfill__"   # Fortschritt der Alt-Post-Runde im Auto-Folgen-Cache
 AF_VF_KEY = "__verify__"     # Rotations-Cursor der Nachprüfung bekannter Liker
+AF_VD_KEY = "__verified__"   # CACHELIKE: zuletzt als "dailyfun folgt" bestätigt (did -> Zeit), TTL AF_VERIFY_TTL
+AF_VERIFY_TTL = int(ENV("FL_AF_VERIFY_TTL", "21600"))
 AF_MS_KEY = "__manual_skip__"  # seit wann ein Konto "von Hand übersprungen" ist (erstmals in manual_skip gesehen)
 
 
@@ -1173,6 +1175,13 @@ def af_verify_order(cands: dict, like_ts: dict, after: str, recent_h: int, now: 
     rest = sorted(d for d in cands if d not in rs)
     rest = [d for d in rest if d > after] + [d for d in rest if d <= after]
     return recent + rest
+
+
+def af_cache_likers(row) -> dict | None:
+    """CACHELIKE: Post-Cache-Eintrag [Zähler, Zeit, {did: Like-Zeit ab Stichtag}] – ältere Einträge ohne Liker-Map -> None."""
+    if isinstance(row, (list, tuple)) and len(row) >= 3 and isinstance(row[2], dict):
+        return row[2]
+    return None
 
 
 def af_profiles(bs: Bsky, dids: list[str]) -> dict:
@@ -1382,6 +1391,10 @@ class AutoFollow:
         # SKIPLIKE-20261115 (Dennis 10:04): "Ein neuer Like hebt das Überspringen auf." Die Bridge liefert keinen
         # Überspringen-Zeitpunkt; der Job merkt sich, seit wann ein Konto in manual_skip steht. Beim ersten Lauf gilt für
         # alle bereits übersprungenen der Stichtag 15.11. 00:00 Berlin, später übersprungene ab dem Lauf, der sie zuerst sieht.
+        self.confirmed: set[str] = set()
+        vd0 = af_state(self.cache, AF_VD_KEY)
+        self.vd: dict[str, int] = {str(k): int(v) for k, v in vd0.items()
+                                   if isinstance(v, (int, float)) and time.time() - float(v) <= AF_VERIFY_TTL}
         self.ms_since: dict[str, float] = {}
         self.ms_state: dict | None = None
         if self.manual_skip is not None:
@@ -1437,7 +1450,15 @@ class AutoFollow:
                   "reason": reason, "follow_uri": follow_uri, "followed_now": followed_now})
         self.known[did] = status
 
-    def post_likers(self, uri: str, likers: dict, liked_recent: dict) -> tuple[bool, bool]:
+    def add_liker(self, did: str, uri: str, t: float, likers: dict, liked_recent: dict) -> None:
+        if did not in likers:
+            likers[did] = uri
+        if t > self.like_ts.get(did, 0.0):
+            self.like_ts[did] = t
+        if did not in liked_recent:
+            liked_recent[did] = uri
+
+    def post_likers(self, uri: str, likers: dict, liked_recent: dict, per: dict | None = None) -> tuple[bool, bool]:
         """Alle Liker eines Posts (Pagination, max. 20 Seiten à 100). Rückgabe (vollständig, Zeitgrenze)."""
         st = self.stats
         cursor, pages = None, 0
@@ -1466,12 +1487,9 @@ class AutoFollow:
                 # egal auf welchem Post. Ältere Likes (oder ohne Zeitstempel) lösen nichts aus.
                 if not af_liked_since_return_cutoff(lt):
                     continue
-                if did not in likers:
-                    likers[did] = uri
-                if lt.timestamp() > self.like_ts.get(did, 0.0):
-                    self.like_ts[did] = lt.timestamp()
-                if did not in liked_recent:
-                    liked_recent[did] = uri
+                self.add_liker(did, uri, lt.timestamp(), likers, liked_recent)
+                if per is not None and int(lt.timestamp()) > int(per.get(did) or 0):
+                    per[did] = int(lt.timestamp())
             cursor = d.get("cursor")
             pages += 1
             if SLEEP_AF:
@@ -1561,8 +1579,14 @@ class AutoFollow:
                 cands[did] = src
         if not cands or AF_VERIFY_MAX <= 0 or left() < AF_BACKFILL_RESERVE / 2:
             return
+        nowt = time.time()
+        cands = {d: v for d, v in cands.items() if nowt - float(self.vd.get(d) or 0) > AF_VERIFY_TTL}
+        if not cands:
+            return
         vf = af_state(self.cache, AF_VF_KEY)
-        order = af_verify_order(cands, self.like_ts, str(vf.get("after") or ""), AF_VERIFY_RECENT_H)[:AF_VERIFY_MAX]
+        order = af_verify_order(cands, self.like_ts, str(vf.get("after") or ""), AF_VERIFY_RECENT_H)
+        # CACHELIKE: übersprungene zuerst (dort ist "dailyfun folgt nicht" wahrscheinlich), dann gefolgte; Rest per TTL im nächsten Lauf
+        order = ([d for d in order if self.known.get(d) == "skipped"] + [d for d in order if self.known.get(d) != "skipped"])[:AF_VERIFY_MAX]
         pp = af_profiles(self.bs, order)
         n_new = 0
         for did in order:
@@ -1573,12 +1597,19 @@ class AutoFollow:
             if not (p.get("viewer") or {}).get("following"):
                 todo[did] = cands[did]
                 n_new += 1
+            else:
+                self.confirm(did)
         rest = [d for d in order if float(self.like_ts.get(d) or 0) < time.time() - AF_VERIFY_RECENT_H * 3600]
         if rest:
             vf["after"] = max(rest)
         self.vf_state = vf
         st["verified"] = len(order)
         st["verify_not_following"] = n_new
+
+    def confirm(self, did: str) -> None:
+        """dailyfun folgt dem Konto (bestätigt) -> nicht mehr im Liker-Cache halten, TTL für die Nachprüfung."""
+        self.confirmed.add(did)
+        self.vd[did] = int(time.time())
 
     def run(self) -> dict:
         st = self.stats
@@ -1627,18 +1658,24 @@ class AutoFollow:
                 uri = str(p.get("uri") or "")
                 if lc == 0 or not uri:
                     continue
-                if not af_cache_stale(self.cache, uri, lc):
-                    new_cache[uri] = self.cache[uri]
+                cached_map = af_cache_likers(self.cache.get(uri))
+                if cached_map is not None and not af_cache_stale(self.cache, uri, lc):
+                    # CACHELIKE: Liker ab Stichtag stehen im Cache -> zählen auch ohne frisches Einlesen
+                    for cd, ct in cached_map.items():
+                        if isinstance(ct, (int, float)) and cd != self.bs.did:
+                            self.add_liker(str(cd), uri, float(ct), likers, liked_recent)
+                    new_cache[uri] = [self.cache[uri][0], self.cache[uri][1], dict(cached_map)]
                     continue
                 if left() < 8:
                     time_limit = True
                     break
                 st["posts"] += 1
-                ok_post, cut = self.post_likers(uri, likers, liked_recent)
+                per: dict = {}
+                ok_post, cut = self.post_likers(uri, likers, liked_recent, per)
                 if cut:
                     time_limit = True
                 if ok_post:
-                    new_cache[uri] = [lc, int(time.time())]
+                    new_cache[uri] = [lc, int(time.time()), per]
             recent_likers = dict(likers)
             bf_likers: dict[str, str] = {}
             self.bf_state = af_state(self.cache, AF_BF_KEY)
@@ -1715,6 +1752,7 @@ class AutoFollow:
                     continue
                 if v.get("following"):
                     self.save(did, p, src, "skipped", "folgst bereits", str(v.get("following") or ""))
+                    self.confirm(did)
                     st["skipped"] += 1
                     continue
                 if v.get("blocking") or v.get("blockedBy") or v.get("muted"):
@@ -1782,6 +1820,7 @@ class AutoFollow:
                     af_err(st, "Bluesky hat das Folgen nicht bestätigt.")
                     continue
                 self.save(did, p, src, "followed", "automatisch", fu, True)
+                self.confirm(did)
                 self.add({"t": "set_fb_before", "did": did, "before": 1 if v.get("followedBy") else 0})
                 st["followed"] += 1
                 budget -= 1
@@ -1809,6 +1848,12 @@ class AutoFollow:
                     self.cache_new[AF_VF_KEY] = vfs
                 if isinstance(self.ms_state, dict):
                     self.cache_new[AF_MS_KEY] = self.ms_state
+                self.cache_new[AF_VD_KEY] = dict(self.vd)
+                if self.confirmed:
+                    for k, row in list(self.cache_new.items()):
+                        m = af_cache_likers(row)
+                        if m:
+                            self.cache_new[k] = [row[0], row[1], {d: t for d, t in m.items() if d not in self.confirmed}]
             try:
                 self.flush()
             except Exception as e:  # noqa: BLE001
