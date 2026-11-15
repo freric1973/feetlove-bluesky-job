@@ -12,7 +12,7 @@ ENTFOLGER-LIKER-20261115: Frühere Entfolger bekommen den sichtbaren Grund AF_RE
 (getLikes createdAt, sonst indexedAt) ab 2026-11-15 00:00 Europe/Berlin belegt ist; sonst bleibt der alte Grund (im Admin ausgeblendet).
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
-BDSMPOST-20261115: täglicher #BDSM-Textpost (Rubrik „Meine BDSM-Welt“, ab 23:30 Europe/Berlin, ohne Bild/Linkkarte, Standard AUS im Admin).
+BDSMPOST-20261115: täglicher #BDSM-Textpost (Rubrik „Meine BDSM-Welt“, ab 23:30 Europe/Berlin, ohne Bild/Linkkarte, Kurzlink /b/<ID>, Standard AUS im Admin).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
 """
 from __future__ import annotations
@@ -1878,14 +1878,14 @@ class AutoFollow:
 # ---------------- Ablauf ----------------
 
 # ---------------- BDSM-Tagespost (BDSMPOST-20261115) ----------------
-# Einmal täglich ein reiner Textpost aus der Rubrik „Meine BDSM-Welt“: erste Zeile „#BDSM“ (Stummschalten), Ü18-Hinweis,
-# Überschrift, 1–2 Sätze, Link (Facet), 2–3 Hashtags. KEIN Bild, KEINE Linkkarte (kein embed). Auswahl, Text und Sperre
+# Einmal täglich ein reiner Textpost aus der Rubrik „Meine BDSM-Welt“: erste Zeile „(zum Stummschalten): #BDSM“, Ü18-Hinweis,
+# Überschrift, 1–2 Sätze, Kurzlink https://feetlove1973.de/b/<ID> (Facet; 301 auf den Slug), 2–3 Hashtags. KEIN Bild, KEINE Linkkarte (kein embed). Auswahl, Text und Sperre
 # kommen von der Seite (bp_pick); hier nur Prüfen, Facets bauen, Posten und Melden (bp_done/bp_fail).
 # Frühestens ab 23:30 Europe/Berlin -> praktisch im Lauf um 23:41. Ein/Aus auf der Tageszahlen-Seite (Standard AUS).
 BP_SLOT = ENV("FL_BP_SLOT", "23:30")
 BP_ON = ENV("FL_BP", "1") != "0"                 # Notschalter im Job (Standard an; der eigentliche Schalter ist im Admin)
 BP_PENDING_TTL = int(ENV("FL_BP_PENDING_TTL", "1200"))
-BP_FIRST_LINE = "#BDSM"
+BP_FIRST_LINE = "(zum Stummschalten): #BDSM"   # Vorgabe Dennis 15.11.2026, #BDSM als Hashtag-Facet
 _BP_TAG = re.compile(r"(?<![\w#])#([^\s#]+)")
 
 
@@ -1897,8 +1897,8 @@ def bp_in_slot(now: datetime | None = None) -> bool:
 def bp_check(pick: dict) -> str:
     """Leerer String = in Ordnung, sonst Grund, warum NICHT gepostet wird."""
     t = str(pick.get("text") or "")
-    if not t.startswith(BP_FIRST_LINE + "\n"):
-        return "erste Zeile ist nicht #BDSM"
+    if t.split("\n", 1)[0] != BP_FIRST_LINE:
+        return "erste Zeile ist nicht „" + BP_FIRST_LINE + "“"
     if len(t) > 300:                                   # Codepunkte >= Grapheme -> sichere Obergrenze
         return f"zu lang ({len(t)} Zeichen)"
     low = t.lower()
@@ -1941,10 +1941,10 @@ def bp_record(pick: dict, now: datetime | None = None) -> dict:
             "createdAt": n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{n.microsecond // 1000:03d}Z"}   # bewusst KEIN embed
 
 
-def bp_find_own(bs: "Bsky", url: str, hours: int = 72) -> str:
-    """Eigener Post mit diesem Link in den letzten X Stunden? (Doppelpost-Schutz)"""
-    base = url.split("?")[0].rstrip("/")
-    if not base:
+def bp_find_own(bs: "Bsky", url: str, hours: int = 72, canonical: str = "") -> str:
+    """Eigener Post mit diesem Link (Kurzlink oder kanonische Adresse) in den letzten X Stunden? (Doppelpost-Schutz)"""
+    bases = {u.split("?")[0].rstrip("/") for u in (url, canonical) if u} - {""}
+    if not bases:
         return ""
     cutoff = time.time() - hours * 3600
     d = bs.get("app.bsky.feed.getAuthorFeed", {"actor": bs.did, "limit": 50, "filter": "posts_no_replies"})
@@ -1957,7 +1957,7 @@ def bp_find_own(bs: "Bsky", url: str, hours: int = 72) -> str:
             continue
         uris = [f2.get("uri", "") for f in rec.get("facets") or [] for f2 in f.get("features") or [] if isinstance(f2, dict)]
         ext = ((rec.get("embed") or {}).get("external") or {}).get("uri", "")
-        if any(str(u).split("?")[0].rstrip("/") == base for u in uris + [ext]):
+        if any(str(u).split("?")[0].rstrip("/") in bases for u in uris + [ext]):
             return str(p.get("uri") or "")
     return ""
 
@@ -1976,7 +1976,7 @@ def bdsm_post(bs: "Bsky", now: datetime | None = None) -> dict:
                 p = r.get("pending") or {}
                 if READONLY:
                     return {"status": "pending (nur lesen)", "post_id": p.get("post_id")}
-                found = bp_find_own(bs, str(p.get("url") or ""))
+                found = bp_find_own(bs, str(p.get("url") or ""), canonical=str(p.get("canonical") or ""))
                 if found:
                     bridge("bp_done", post_id=int(p.get("post_id") or 0), uri=found, recovered=True)
                     if p.get("today"):
@@ -1998,7 +1998,7 @@ def bdsm_post(bs: "Bsky", now: datetime | None = None) -> dict:
                 return {"status": "abgelehnt", "grund": why, "post_id": pick.get("post_id")}
             if st == "preview" or READONLY:
                 return {"status": "vorschau (nur lesen)", "post_id": pick.get("post_id"), "zeichen": len(pick["text"])}
-            found = bp_find_own(bs, str(pick["url"]), hours=20)
+            found = bp_find_own(bs, str(pick["url"]), hours=20, canonical=str(pick.get("canonical") or ""))
             if found:                                         # schon von Hand gepostet o. ä. -> nicht doppelt
                 bridge("bp_done", post_id=int(pick["post_id"]), uri=found, recovered=True, title=pick.get("title", ""),
                        url=pick["url"], text=pick["text"])
@@ -2011,7 +2011,7 @@ def bdsm_post(bs: "Bsky", now: datetime | None = None) -> dict:
                 if not (isinstance(e, BskyHttpError) and 0 < e.code < 500):
                     time.sleep(3)                             # unklar, ob angekommen -> im Feed nachsehen
                     try:
-                        uri = bp_find_own(bs, str(pick["url"]), hours=2)
+                        uri = bp_find_own(bs, str(pick["url"]), hours=2, canonical=str(pick.get("canonical") or ""))
                     except Exception:  # noqa: BLE001
                         uri = ""
                 if not uri:

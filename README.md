@@ -35,7 +35,7 @@ Vorgabe: Wer einen Beitrag von dailyfun geliked hat und dem dailyfun nicht folgt
 
 Einmal täglich ein reiner Textpost aus der Rubrik „Meine BDSM-Welt“ (Kategorie-Slug `meine-bdsm-welt`), im Lauf um 23:41 Europe/Berlin (frühestens ab 23:30, `FL_BP_SLOT`).
 
-- Erste Zeile immer `#BDSM` (Hashtag-Facet, damit man es stummschalten kann), dann Ü18-Hinweis, Überschrift, 1–2 Sätze aus der Meta-Beschreibung, Link (Link-Facet), 2–3 Hashtags aus den Schlagwörtern (nie „Hornhaut“, #BDSM nicht doppelt). Max. 300 Zeichen.
+- Erste Zeile immer `(zum Stummschalten): #BDSM` (#BDSM als Hashtag-Facet), dann Ü18-Hinweis, Überschrift, 1–2 Sätze aus der Meta-Beschreibung, Kurzlink `feetlove1973.de/b/<ID>` (Link-Facet; /b/ leitet per 301 auf den Slug und hängt `?shared=1&src=bluesky` an), 2–3 Hashtags aus den Schlagwörtern (nie „Hornhaut“, #BDSM nicht doppelt). Max. 300 Zeichen.
 - **Kein Bild, keine Linkkarte**: der Post hat kein `embed`.
 - Auswahl, Text und Doppelpost-Sperre kommen von der Seite (`bp_pick`, Lease nötig); Ergebnis über `bp_done` / `bp_fail`. Vor dem Posten prüft der Job den eigenen Feed auf denselben Link.
 - Ein/Aus auf der Tageszahlen-Seite (Standard **aus**). Notschalter im Job: `FL_BP=0`. Nur-Lesen postet nie und setzt keine Sperre.
