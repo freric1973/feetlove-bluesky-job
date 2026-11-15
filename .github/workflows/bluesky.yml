@@ -28,7 +28,7 @@ jobs:
           FL_BRIDGE_SECRET: ${{ secrets.FL_BRIDGE_SECRET }}
           BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
           BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
-          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           # Planläufe: normal. Handstart: standardmäßig nur lesen.
           FL_READONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.readonly && '1' || '0' }}
           FL_UF_SCAN_MIN: "240"

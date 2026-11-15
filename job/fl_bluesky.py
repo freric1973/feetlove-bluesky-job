@@ -3,7 +3,7 @@
 
 Portierung von bluesky-autolike.php (Stand AUTOLIKE-500-20261113), dem Abgleich aus
 bluesky-unfollowers.php und flb_af_run() aus bluesky-autofollow.php. Gleiche Regeln: echte Frage/Beleidigung -> Prüfung,
-KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf (Setting bluesky_autolike_max, Standard 50), nie doppelt liken
+KI-Check (nur Gemini, inkl. echte_frage; xAI entfernt 15.11.2026), Like-Limit je Lauf (Setting bluesky_autolike_max, Standard 50), nie doppelt liken
 (viewer.like wird vor jedem Like geprüft), geblockte/Zweitkonten/stummgeschaltete überspringen, Testmodus (dryrun) wird respektiert.
 Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), Limit je Lauf und Tag aus den Admin-Einstellungen, nicht schon gefolgt,
 nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; bis einschließlich Setting autofollow_reunfollowed_until (Standard 2027-02-14, Europe/Berlin) auch Liker mit reason „von dir entfolgt“; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
@@ -27,8 +27,8 @@ BSKY_HANDLE = ENV("BSKY_HANDLE", "")
 BSKY_PW = ENV("BSKY_APP_PASSWORD", "")
 BSKY_SERVICE = ENV("BSKY_SERVICE", "https://bsky.social").rstrip("/")
 RELAY = ENV("BSKY_RELAY", "https://bsky.network").rstrip("/")
-XAI_KEY = ENV("XAI_API_KEY", "")
-XAI_BASE = ENV("XAI_BASE", "https://api.x.ai").rstrip("/")
+GEMINI_KEY = ENV("GEMINI_API_KEY", "")
+GEMINI_BASE = ENV("GEMINI_BASE", "https://generativelanguage.googleapis.com").rstrip("/")
 READONLY = ENV("FL_READONLY", "0") == "1"          # nur lesen: keine Likes, kein Entfolgen, kein Folgen, nichts in die DB
 UF_SCAN_MIN = int(ENV("FL_UF_SCAN_MIN", "240"))     # Follower-Abgleich höchstens alle X Minuten
 MAX_RUNTIME = float(ENV("FL_MAX_RUNTIME", "420"))   # Sicherheitsgrenze je Lauf (Sekunden)
@@ -243,24 +243,71 @@ def insult_hit(t: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-XAI_MODEL = "grok-4.3"
+GEMINI_MODEL = ENV("GEMINI_MODEL", "") or "gemini-3.5-flash-lite"
 SYSTEM_PROMPT = ('Du prüfst Antworten auf Social-Media-Posts des Bloggers Dennis. negative=true NUR, wenn die Antwort Dennis PERSÖNLICH beleidigt, beschimpft, verhöhnt, bedroht oder belästigt (Beleidigungen, Schimpfwörter gegen ihn, Hass, abwertende Aussagen über seine Person, sexuelle Belästigung, Drohungen). negative=false für alles andere, insbesondere: Kritik an einem Thema, an Firmen (z. B. Google), Produkten, Politik oder Meinungen; Widerspruch in der Sache; Sarkasmus oder Spott über das Thema; Witze, Wortspiele, Insider, Emojis; kurze oder rätselhafte Antworten (z. B. "Hex, Hex"); Zustimmung, Flirt, Neutrales. Im Zweifel negative=false. echte_frage=true NUR, wenn der Antwortende von Dennis wirklich eine Antwort erwartet (eine echte, an ihn gerichtete Frage). echte_frage=false für Witze, Sprüche, rhetorische oder ausrufende Fragen und Scherze mit Fragezeichen (z. B. „… Bluna!?“, „Wieso Der? 🤭“, „Bin ich etwa schon drin oder was?“). Im Zweifel, ob wirklich eine Antwort erwartet wird: echte_frage=true. reason: max. 8 Wörter, deutsch.')
 
 
+class AiBlocked(RuntimeError):
+    """Gemini hat die Prüfung inhaltlich verweigert (Safety/PROHIBITED_CONTENT) – kein Lauf-Fehler, Antwort zur Handprüfung."""
+
+
+GEMINI_SAFETY = [{"category": c, "threshold": "BLOCK_NONE"} for c in (
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_DANGEROUS_CONTENT")]
+GEMINI_SCHEMA = {"type": "OBJECT", "properties": {"negative": {"type": "BOOLEAN"}, "echte_frage": {"type": "BOOLEAN"}, "reason": {"type": "STRING"}},
+                 "required": ["negative", "echte_frage", "reason"]}
+
+
+def gemini_payload(text: str, parent: str) -> dict:
+    return {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT + " Gib ausschließlich ein JSON-Objekt mit negative, echte_frage und reason zurück."}]},
+            "contents": [{"role": "user", "parts": [{"text": "Ursprungspost (Kontext):\n" + parent[:500] + "\n\nAntwort:\n" + text[:1000]}]}],
+            "generationConfig": {"temperature": 0, "maxOutputTokens": 2048, "responseMimeType": "application/json", "responseSchema": GEMINI_SCHEMA},
+            "safetySettings": GEMINI_SAFETY}
+
+
+def gemini_error_text(code: int, raw: str) -> str:
+    try:
+        err = (json.loads(raw or "{}") or {}).get("error") or {}
+    except ValueError:
+        err = {}
+    status = str(err.get("status") or "") if isinstance(err, dict) else ""
+    msg = (str(err.get("message") or "") if isinstance(err, dict) else "").lower()
+    if code == 429 and ("quota" in msg or status == "RESOURCE_EXHAUSTED"):
+        return f"Gemini HTTP {code} (Kontingent erreicht)"
+    if code in (401, 403) or status in ("PERMISSION_DENIED", "UNAUTHENTICATED") or "api key" in msg:
+        return f"Gemini HTTP {code} (Key ungültig oder ohne Freigabe)"
+    if code == 404:
+        return f"Gemini HTTP 404 (Modell {GEMINI_MODEL} nicht gefunden)"
+    return f"Gemini HTTP {code}" + (f" ({status})" if status else "")
+
+
+def gemini_parse(d: dict) -> tuple[bool, bool, str]:
+    """Antwort von generateContent auswerten. AiBlocked bei Safety-Sperre, RuntimeError bei unklarer Antwort."""
+    pf = (d.get("promptFeedback") or {}).get("blockReason")
+    if pf:
+        raise AiBlocked(f"Gemini blockiert ({pf})")
+    cand = (d.get("candidates") or [{}])[0] or {}
+    fr = str(cand.get("finishReason") or "")
+    if fr in ("SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION"):
+        raise AiBlocked(f"Gemini blockiert ({fr})")
+    txt = "".join(str(p.get("text") or "") for p in ((cand.get("content") or {}).get("parts") or []) if isinstance(p, dict) and not p.get("thought"))
+    try:
+        r = json.loads(txt.strip() or "")
+    except ValueError:
+        r = None
+    if not isinstance(r, dict) or "negative" not in r or "echte_frage" not in r:
+        raise RuntimeError(f"KI-Antwort unklar ({fr or '-'})")
+    return bool(r["negative"]), bool(r["echte_frage"]), str(r.get("reason", "")).strip()[:120]
+
+
 def ai_check(text: str, parent: str, deadline: float | None = None) -> tuple[bool, bool, str]:
-    if not XAI_KEY:
-        raise RuntimeError("xAI-Key fehlt")
-    schema = {"type": "object", "properties": {"negative": {"type": "boolean"}, "echte_frage": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["negative", "echte_frage", "reason"], "additionalProperties": False}
-    payload = {"model": XAI_MODEL, "temperature": 0, "max_tokens": 300, "messages": [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": "Ursprungspost (Kontext):\n" + parent[:500] + "\n\nAntwort:\n" + text[:1000]}],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "reply_check", "strict": True, "schema": schema}}}
-    body = json.dumps(payload, ensure_ascii=False).encode()
+    if not GEMINI_KEY:
+        raise RuntimeError("Gemini-Key fehlt (Secret GEMINI_API_KEY)")
+    body = json.dumps(gemini_payload(text, parent), ensure_ascii=False).encode()
+    url = GEMINI_BASE + "/v1beta/models/" + urllib.parse.quote(GEMINI_MODEL, safe="") + ":generateContent"
     t_end = time.monotonic() + (deadline if deadline is not None else 90)
     d: dict = {}
     for attempt in range(4):
-        req = urllib.request.Request(XAI_BASE + "/v1/chat/completions", data=body,
-                                     headers={"Content-Type": "application/json", "Authorization": "Bearer " + XAI_KEY}, method="POST")
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY}, method="POST")
         t1 = time.monotonic(); wait_s = 0.0
         try:
             with urllib.request.urlopen(req, timeout=max(3.0, min(30.0, t_end - t1))) as r:
@@ -268,17 +315,15 @@ def ai_check(text: str, parent: str, deadline: float | None = None) -> tuple[boo
             break
         except urllib.error.HTTPError as e:
             raw = e.read().decode(errors="replace")
-            if e.code == 403 and "credits" in raw.lower():
-                raise RuntimeError("xAI HTTP 403 (Guthaben/Ausgabelimit erreicht)")
-            fail = RuntimeError(f"xAI HTTP {e.code}")
-            if e.code != 429 and e.code < 500:
+            fail = RuntimeError(gemini_error_text(e.code, raw))
+            if "Kontingent" in str(fail) or (e.code != 429 and e.code < 500):
                 raise fail
             try:
                 wait_s = float(e.headers.get("Retry-After") or 0)
             except (TypeError, ValueError):
                 wait_s = 0.0
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
-            fail = RuntimeError("xAI HTTP 0")
+            fail = RuntimeError("Gemini HTTP 0")
         finally:
             with _AI_LOCK:
                 _AI["calls"] += 1; _AI["secs"] += time.monotonic() - t1
@@ -288,14 +333,7 @@ def ai_check(text: str, parent: str, deadline: float | None = None) -> tuple[boo
         with _AI_LOCK:
             _AI["retries"] += 1
         time.sleep(wait_s)
-    ch = (d.get("choices") or [{}])[0]
-    try:
-        r = json.loads((ch.get("message") or {}).get("content") or "")
-    except ValueError:
-        r = None
-    if not isinstance(r, dict) or "negative" not in r or "echte_frage" not in r:
-        raise RuntimeError(f"KI-Antwort unklar ({ch.get('finish_reason') or '-'})")
-    return bool(r["negative"]), bool(r["echte_frage"]), str(r.get("reason", "")).strip()[:120]
+    return gemini_parse(d)
 
 
 def needs_ai(text: str) -> bool:
@@ -309,6 +347,10 @@ def classify(text: str, parent: str, deadline: float | None = None) -> tuple[str
         return "review", f"Beleidigend: „{w}“"
     try:
         neg, echte_frage, why = ai_check(text, parent, deadline)
+    except AiBlocked as e:
+        if is_question(text):
+            return "review", "Frage"
+        return "review", str(e) + " – bitte selbst ansehen"
     except Exception as e:  # noqa: BLE001
         if is_question(text):
             return "review", "Frage"
@@ -1589,7 +1631,7 @@ class AutoFollow:
 # ---------------- Ablauf ----------------
 
 def main() -> int:
-    global XAI_MODEL
+    global GEMINI_MODEL
     missing = [n for n, v in (("FL_BRIDGE_URL", BRIDGE_URL), ("FL_BRIDGE_SECRET", BRIDGE_SECRET), ("BSKY_HANDLE", BSKY_HANDLE), ("BSKY_APP_PASSWORD", BSKY_PW)) if not v]
     if missing:
         log("Fehlende Secrets: " + ", ".join(missing)); return 2
@@ -1601,7 +1643,7 @@ def main() -> int:
         return 0
     if st.get("status") != "ready":
         log(f"Kein Lauf: {st.get('status')} {st.get('reason', '')}"); return 0
-    XAI_MODEL = st.get("xai_model") or XAI_MODEL
+    GEMINI_MODEL = str(st.get("gemini_model") or "") or GEMINI_MODEL
     al_stats: dict = {"ok": True, "status": "disabled", "errors": []}; uf_res: dict = {"status": "skipped"}
     af_stats: dict = {"ok": True, "status": "skipped", "errors": []}
     al = None; af = None; ran = False; af_ran = False
