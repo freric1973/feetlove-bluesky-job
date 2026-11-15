@@ -38,5 +38,6 @@ Einmal täglich ein reiner Textpost aus der Rubrik „Meine BDSM-Welt“ (Katego
 - Erste Zeile immer `(zum Stummschalten): #BDSM` (#BDSM als Hashtag-Facet), dann Ü18-Hinweis, Überschrift, 1–2 Sätze aus der Meta-Beschreibung, Kurzlink `feetlove1973.de/b/<ID>` (Link-Facet; /b/ leitet per 301 auf den Slug und hängt `?shared=1&src=bluesky` an), 2–3 Hashtags aus den Schlagwörtern (nie „Hornhaut“, #BDSM nicht doppelt). Max. 300 Zeichen.
 - **Kein Bild, keine Linkkarte**: der Post hat kein `embed`.
 - Auswahl, Text und Doppelpost-Sperre kommen von der Seite (`bp_pick`, Lease nötig); Ergebnis über `bp_done` / `bp_fail`. Vor dem Posten prüft der Job den eigenen Feed auf denselben Link.
+- Auswahl (Seite): neue Beiträge zuerst, sonst am längsten nicht gepostet; derselbe Beitrag frühestens nach 60 Tagen. **Lücke** (alle gesperrt): trotzdem der am längsten nicht gepostete, nie zweimal am selben Tag (Dennis, 15.11.2026).
 - Ein/Aus auf der Tageszahlen-Seite (Standard **aus**). Notschalter im Job: `FL_BP=0`. Nur-Lesen postet nie und setzt keine Sperre.
 - Fehler beim Tagespost ändern den Exit-Code nicht; sie stehen im Log („BDSM-Tagespost: …“) und in der Liste auf der Tageszahlen-Seite.
