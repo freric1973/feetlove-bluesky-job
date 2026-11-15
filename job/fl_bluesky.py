@@ -1148,6 +1148,7 @@ def af_cache_stale(cache: dict, uri: str, count: int, max_age: int = 21600) -> b
 
 AF_BF_KEY = "__backfill__"   # Fortschritt der Alt-Post-Runde im Auto-Folgen-Cache
 AF_VF_KEY = "__verify__"     # Rotations-Cursor der Nachprüfung bekannter Liker
+AF_MS_KEY = "__manual_skip__"  # seit wann ein Konto "von Hand übersprungen" ist (erstmals in manual_skip gesehen)
 
 
 def af_state(cache: dict, key: str) -> dict:
@@ -1378,6 +1379,21 @@ class AutoFollow:
         # Alte Bridge (ohne manual_skip): skipped nur nachprüfen, wenn die Zeile in recheck steht – die Bridge schickt dort
         # nur Gründe 'automatisch','folgst bereits','von Hand gefolgt','manuell', also nie "von Hand übersprungen".
         self.skip_ok_fallback = set(str(x) for x in (self.af.get("recheck") or []))
+        # SKIPLIKE-20261115 (Dennis 10:04): "Ein neuer Like hebt das Überspringen auf." Die Bridge liefert keinen
+        # Überspringen-Zeitpunkt; der Job merkt sich, seit wann ein Konto in manual_skip steht. Beim ersten Lauf gilt für
+        # alle bereits übersprungenen der Stichtag 15.11. 00:00 Berlin, später übersprungene ab dem Lauf, der sie zuerst sieht.
+        self.ms_since: dict[str, float] = {}
+        self.ms_state: dict | None = None
+        if self.manual_skip is not None:
+            prev_ms = af_state(self.cache, AF_MS_KEY)
+            seen = prev_ms.get("m") if isinstance(prev_ms.get("m"), dict) else {}
+            init = bool(prev_ms.get("init"))
+            base = AF_RETURN_LIKE_SINCE.timestamp()
+            nowt = float(int(time.time()))
+            for d in self.manual_skip:
+                v = seen.get(d)
+                self.ms_since[d] = float(v) if isinstance(v, (int, float)) else (nowt if init else base)
+            self.ms_state = {"init": 1, "m": {d: int(t) for d, t in self.ms_since.items()}}
         self.like_ts: dict[str, float] = {}   # did -> jüngster Like (Unix-Zeit)
         self.cache_new: dict | None = None
         self.new_cursor: str | None = None
@@ -1532,7 +1548,13 @@ class AutoFollow:
                 continue
             prev = self.known.get(did)
             if prev == "skipped":
-                ok = (did not in self.manual_skip) if self.manual_skip is not None else (did in self.skip_ok_fallback)
+                if self.manual_skip is None:
+                    ok = did in self.skip_ok_fallback
+                elif did in self.manual_skip:
+                    # von Hand übersprungen: nur ein Like NACH dem Überspringen hebt es auf
+                    ok = float(self.like_ts.get(did) or 0) > self.ms_since.get(did, AF_RETURN_LIKE_SINCE.timestamp())
+                else:
+                    ok = True
             else:
                 ok = prev == "followed"
             if ok:
@@ -1785,6 +1807,8 @@ class AutoFollow:
                     self.cache_new[AF_BF_KEY] = bfs
                 if isinstance(vfs, dict):
                     self.cache_new[AF_VF_KEY] = vfs
+                if isinstance(self.ms_state, dict):
+                    self.cache_new[AF_MS_KEY] = self.ms_state
             try:
                 self.flush()
             except Exception as e:  # noqa: BLE001
