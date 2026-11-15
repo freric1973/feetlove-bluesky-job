@@ -20,9 +20,11 @@ Ergebnis nur über die Bridge (af_save / finish).
 
 Vorgabe: Wer einen Beitrag von dailyfun geliked hat und dem dailyfun nicht folgt, wird automatisch gefolgt – bei jedem Beitrag.
 
+**Ab heute (Dennis, 15.11.2026):** Es zählen nur Likes mit `createdAt` (ersatzweise `indexedAt`) ab 15.11.2026 00:00 Europe/Berlin – egal auf welchem (auch altem) Post. Ältere Likes lösen nichts aus.
+
 - Posts der letzten `autofollow_days` werden wie bisher in jedem Lauf geprüft (Cache: nur bei geändertem Like-Zähler oder alle 6 h).
 - Ältere Posts: Rundlauf über das ganze Profil, `FL_AF_BACKFILL_POSTS` (150) Posts je Lauf; Fortschritt steht im Auto-Folgen-Cache (`__backfill__`).
   Eine Runde über ~17.000 Posts dauert damit gut zwei Tage, danach beginnt sie von vorn (neue Likes auf alten Posts).
-- Bekannte Liker mit Status followed/skipped werden live nachgeprüft (max. `FL_AF_VERIFY_MAX` = 300 je Lauf, Likes der letzten 48 h zuerst).
-  Folgt dailyfun ihnen nicht (mehr), werden sie gefolgt. Ausgenommen: von Hand übersprungen (`manual_skip` von der Bridge), blocked, Blockierungen/Stummschaltungen, Spam-Labels, frühere Entfolger ohne Rückfolge.
+- Bekannte Liker (Like ab Stichtag) mit Status followed/skipped werden live nachgeprüft (max. `FL_AF_VERIFY_MAX` = 300 je Lauf, Likes der letzten 48 h zuerst).
+  Folgt dailyfun ihnen nicht (mehr), werden sie gefolgt. Ausgenommen: von Hand übersprungen (`manual_skip` von der Bridge; ältere Bridge ohne Liste: skipped nur, wenn in `recheck`), blocked, Blockierungen/Stummschaltungen, Spam-Labels, frühere Entfolger ohne Rückfolge.
 - Limits bleiben: `max_run` (20) je Lauf, `max_day` (400) je Tag. Rückstand wird gedrosselt als would_follow gemerkt (max. `FL_AF_QUEUE_MAX` = 300 je Lauf), `stats.backlog` zeigt die Restmenge des Laufs.

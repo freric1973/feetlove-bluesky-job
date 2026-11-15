@@ -1375,6 +1375,9 @@ class AutoFollow:
         # skipped-Zeilen gar nicht nachprüfen (sicher), nur followed.
         ms = self.af.get("manual_skip")
         self.manual_skip: set[str] | None = set(str(x) for x in ms) if isinstance(ms, list) else None
+        # Alte Bridge (ohne manual_skip): skipped nur nachprüfen, wenn die Zeile in recheck steht – die Bridge schickt dort
+        # nur Gründe 'automatisch','folgst bereits','von Hand gefolgt','manuell', also nie "von Hand übersprungen".
+        self.skip_ok_fallback = set(str(x) for x in (self.af.get("recheck") or []))
         self.like_ts: dict[str, float] = {}   # did -> jüngster Like (Unix-Zeit)
         self.cache_new: dict | None = None
         self.new_cursor: str | None = None
@@ -1442,12 +1445,16 @@ class AutoFollow:
                 did = str(actor.get("did") or "")
                 if not did or did == self.bs.did:
                     continue
+                lt = af_like_time(lk)
+                # ALLELIKES "Ab heute" (Dennis 15.11.2026): nur Likes ab AF_RETURN_LIKE_SINCE (15.11. 00:00 Berlin) zählen,
+                # egal auf welchem Post. Ältere Likes (oder ohne Zeitstempel) lösen nichts aus.
+                if not af_liked_since_return_cutoff(lt):
+                    continue
                 if did not in likers:
                     likers[did] = uri
-                lt = af_like_time(lk)
-                if lt is not None and lt.timestamp() > self.like_ts.get(did, 0.0):
+                if lt.timestamp() > self.like_ts.get(did, 0.0):
                     self.like_ts[did] = lt.timestamp()
-                if did not in liked_recent and af_liked_since_return_cutoff(lt):
+                if did not in liked_recent:
                     liked_recent[did] = uri
             cursor = d.get("cursor")
             pages += 1
@@ -1524,7 +1531,11 @@ class AutoFollow:
             if did in todo:
                 continue
             prev = self.known.get(did)
-            if prev == "followed" or (prev == "skipped" and self.manual_skip is not None and did not in self.manual_skip):
+            if prev == "skipped":
+                ok = (did not in self.manual_skip) if self.manual_skip is not None else (did in self.skip_ok_fallback)
+            else:
+                ok = prev == "followed"
+            if ok:
                 cands[did] = src
         if not cands or AF_VERIFY_MAX <= 0 or left() < AF_BACKFILL_RESERVE / 2:
             return
