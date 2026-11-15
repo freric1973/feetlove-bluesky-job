@@ -30,3 +30,13 @@ Vorgabe: Wer einen Beitrag von dailyfun geliked hat und dem dailyfun nicht folgt
 - Limits bleiben: `max_run` (20) je Lauf, `max_day` (400) je Tag. Rückstand wird gedrosselt als would_follow gemerkt (max. `FL_AF_QUEUE_MAX` = 300 je Lauf), `stats.backlog` zeigt die Restmenge des Laufs.
 - Von Hand übersprungen (Tageszahlen): Ein Like NACH dem Überspringen hebt es auf (Dennis, 15.11. 10:04). Der Zeitpunkt kommt nicht von der Bridge; der Job merkt sich im Cache (`__manual_skip__`), seit wann ein Konto in `manual_skip` steht. Bereits beim ersten Lauf übersprungene gelten ab Stichtag 15.11. 00:00 Berlin.
 - Liker-Cache (CACHELIKE): Post-Cache-Einträge enthalten die Likes ab Stichtag (`[Zähler, Zeit, {did: Like-Zeit}]`), damit Liker auch ohne frisches Einlesen zählen; bestätigte (dailyfun folgt) fliegen heraus. Nachprüfung: übersprungene zuerst, bestätigte 6 h nicht erneut (`__verified__`).
+
+## BDSM-Tagespost (BDSMPOST-20261115)
+
+Einmal täglich ein reiner Textpost aus der Rubrik „Meine BDSM-Welt“ (Kategorie-Slug `meine-bdsm-welt`), im Lauf um 23:41 Europe/Berlin (frühestens ab 23:30, `FL_BP_SLOT`).
+
+- Erste Zeile immer `#BDSM` (Hashtag-Facet, damit man es stummschalten kann), dann Ü18-Hinweis, Überschrift, 1–2 Sätze aus der Meta-Beschreibung, Link (Link-Facet), 2–3 Hashtags aus den Schlagwörtern (nie „Hornhaut“, #BDSM nicht doppelt). Max. 300 Zeichen.
+- **Kein Bild, keine Linkkarte**: der Post hat kein `embed`.
+- Auswahl, Text und Doppelpost-Sperre kommen von der Seite (`bp_pick`, Lease nötig); Ergebnis über `bp_done` / `bp_fail`. Vor dem Posten prüft der Job den eigenen Feed auf denselben Link.
+- Ein/Aus auf der Tageszahlen-Seite (Standard **aus**). Notschalter im Job: `FL_BP=0`. Nur-Lesen postet nie und setzt keine Sperre.
+- Fehler beim Tagespost ändern den Exit-Code nicht; sie stehen im Log („BDSM-Tagespost: …“) und in der Liste auf der Tageszahlen-Seite.

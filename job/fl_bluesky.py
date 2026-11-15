@@ -12,6 +12,7 @@ ENTFOLGER-LIKER-20261115: Frühere Entfolger bekommen den sichtbaren Grund AF_RE
 (getLikes createdAt, sonst indexedAt) ab 2026-11-15 00:00 Europe/Berlin belegt ist; sonst bleibt der alte Grund (im Admin ausgeblendet).
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
+BDSMPOST-20261115: täglicher #BDSM-Textpost (Rubrik „Meine BDSM-Welt“, ab 23:30 Europe/Berlin, ohne Bild/Linkkarte, Standard AUS im Admin).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
 """
 from __future__ import annotations
@@ -1876,6 +1877,159 @@ class AutoFollow:
 
 # ---------------- Ablauf ----------------
 
+# ---------------- BDSM-Tagespost (BDSMPOST-20261115) ----------------
+# Einmal täglich ein reiner Textpost aus der Rubrik „Meine BDSM-Welt“: erste Zeile „#BDSM“ (Stummschalten), Ü18-Hinweis,
+# Überschrift, 1–2 Sätze, Link (Facet), 2–3 Hashtags. KEIN Bild, KEINE Linkkarte (kein embed). Auswahl, Text und Sperre
+# kommen von der Seite (bp_pick); hier nur Prüfen, Facets bauen, Posten und Melden (bp_done/bp_fail).
+# Frühestens ab 23:30 Europe/Berlin -> praktisch im Lauf um 23:41. Ein/Aus auf der Tageszahlen-Seite (Standard AUS).
+BP_SLOT = ENV("FL_BP_SLOT", "23:30")
+BP_ON = ENV("FL_BP", "1") != "0"                 # Notschalter im Job (Standard an; der eigentliche Schalter ist im Admin)
+BP_PENDING_TTL = int(ENV("FL_BP_PENDING_TTL", "1200"))
+BP_FIRST_LINE = "#BDSM"
+_BP_TAG = re.compile(r"(?<![\w#])#([^\s#]+)")
+
+
+def bp_in_slot(now: datetime | None = None) -> bool:
+    n = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("Europe/Berlin"))
+    return n.strftime("%H:%M") >= BP_SLOT
+
+
+def bp_check(pick: dict) -> str:
+    """Leerer String = in Ordnung, sonst Grund, warum NICHT gepostet wird."""
+    t = str(pick.get("text") or "")
+    if not t.startswith(BP_FIRST_LINE + "\n"):
+        return "erste Zeile ist nicht #BDSM"
+    if len(t) > 300:                                   # Codepunkte >= Grapheme -> sichere Obergrenze
+        return f"zu lang ({len(t)} Zeichen)"
+    low = t.lower()
+    if "hornhaut" in low:
+        return "enthält „Hornhaut“"
+    if len(re.findall(r"(?<![\w#])#bdsm(?![\w])", low)) != 1:
+        return "#BDSM nicht genau einmal"
+    if "\\n" in t:
+        return "sichtbare Steuerzeichen"
+    lt, url = str(pick.get("link_text") or ""), str(pick.get("url") or "")
+    if not lt or lt not in t or not url.startswith("https://"):
+        return "Link fehlt"
+    if not str(pick.get("url", "")).split("?")[0].rstrip("/").split("/")[-1]:
+        return "Link ohne Beitrag"
+    return ""
+
+
+def bp_facets(text: str, link_text: str, url: str, hashtags: list) -> list:
+    def b(i: int) -> int:
+        return len(text[:i].encode("utf-8"))
+    out = []
+    i = text.rfind(link_text)
+    if i >= 0:
+        out.append({"index": {"byteStart": b(i), "byteEnd": b(i + len(link_text))},
+                    "features": [{"$type": "app.bsky.richtext.facet#link", "uri": url}]})
+    want = {str(h).lstrip("#").lower() for h in hashtags or []}
+    for m in _BP_TAG.finditer(text):
+        tag = m.group(1).rstrip(".,;:!?…")
+        if tag.lower() in want:
+            out.append({"index": {"byteStart": b(m.start()), "byteEnd": b(m.start() + 1 + len(tag))},
+                        "features": [{"$type": "app.bsky.richtext.facet#tag", "tag": tag}]})
+    return sorted(out, key=lambda f: f["index"]["byteStart"])
+
+
+def bp_record(pick: dict, now: datetime | None = None) -> dict:
+    n = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    t = str(pick["text"])
+    return {"$type": "app.bsky.feed.post", "text": t, "langs": ["de"],
+            "facets": bp_facets(t, str(pick["link_text"]), str(pick["url"]), list(pick.get("hashtags") or [])),
+            "createdAt": n.strftime("%Y-%m-%dT%H:%M:%S.") + f"{n.microsecond // 1000:03d}Z"}   # bewusst KEIN embed
+
+
+def bp_find_own(bs: "Bsky", url: str, hours: int = 72) -> str:
+    """Eigener Post mit diesem Link in den letzten X Stunden? (Doppelpost-Schutz)"""
+    base = url.split("?")[0].rstrip("/")
+    if not base:
+        return ""
+    cutoff = time.time() - hours * 3600
+    d = bs.get("app.bsky.feed.getAuthorFeed", {"actor": bs.did, "limit": 50, "filter": "posts_no_replies"})
+    for it in d.get("feed", []) or []:
+        p = it.get("post") or {}
+        if (it.get("reason") or {}) or (p.get("author") or {}).get("did") != bs.did:
+            continue
+        rec = p.get("record") or {}
+        if ts(str(rec.get("createdAt") or p.get("indexedAt") or "")) < cutoff:
+            continue
+        uris = [f2.get("uri", "") for f in rec.get("facets") or [] for f2 in f.get("features") or [] if isinstance(f2, dict)]
+        ext = ((rec.get("embed") or {}).get("external") or {}).get("uri", "")
+        if any(str(u).split("?")[0].rstrip("/") == base for u in uris + [ext]):
+            return str(p.get("uri") or "")
+    return ""
+
+
+def bdsm_post(bs: "Bsky", now: datetime | None = None) -> dict:
+    """Nie Ausnahme nach außen. Ergebnis nur fürs Log; Zustand steht auf der Seite."""
+    if not BP_ON:
+        return {"status": "aus (FL_BP=0)"}
+    if not bp_in_slot(now):
+        return {"status": "noch nicht dran"}
+    try:
+        for _ in range(2):
+            r = bridge("bp_pick", dry=READONLY)
+            st = r.get("status")
+            if st == "pending":
+                p = r.get("pending") or {}
+                if READONLY:
+                    return {"status": "pending (nur lesen)", "post_id": p.get("post_id")}
+                found = bp_find_own(bs, str(p.get("url") or ""))
+                if found:
+                    bridge("bp_done", post_id=int(p.get("post_id") or 0), uri=found, recovered=True)
+                    if p.get("today"):
+                        return {"status": "posted", "uri": found, "recovered": True}
+                    continue                                  # alter Tag aufgeräumt -> heutigen Post holen
+                if p.get("today") and int(p.get("age") or 0) < BP_PENDING_TTL:
+                    return {"status": "anderer Lauf postet gerade"}
+                bridge("bp_fail", message="Abgebrochener Versuch, Post nicht im Feed gefunden")
+                if p.get("today"):
+                    return {"status": "abgebrochen", "post_id": p.get("post_id")}
+                continue
+            if st not in ("go", "preview"):
+                return {"status": st}                          # disabled / not_yet / done / empty / missing
+            pick = r.get("pick") or {}
+            why = bp_check(pick)
+            if why:
+                if st == "go":
+                    bridge("bp_fail", message="Nicht gepostet: " + why)
+                return {"status": "abgelehnt", "grund": why, "post_id": pick.get("post_id")}
+            if st == "preview" or READONLY:
+                return {"status": "vorschau (nur lesen)", "post_id": pick.get("post_id"), "zeichen": len(pick["text"])}
+            found = bp_find_own(bs, str(pick["url"]), hours=20)
+            if found:                                         # schon von Hand gepostet o. ä. -> nicht doppelt
+                bridge("bp_done", post_id=int(pick["post_id"]), uri=found, recovered=True, title=pick.get("title", ""),
+                       url=pick["url"], text=pick["text"])
+                return {"status": "posted", "uri": found, "recovered": True}
+            try:
+                d = bs.post("com.atproto.repo.createRecord", {"repo": bs.did, "collection": "app.bsky.feed.post", "record": bp_record(pick, now)})
+                uri = str(d.get("uri") or "")
+            except Exception as e:  # noqa: BLE001
+                uri = ""
+                if not (isinstance(e, BskyHttpError) and 0 < e.code < 500):
+                    time.sleep(3)                             # unklar, ob angekommen -> im Feed nachsehen
+                    try:
+                        uri = bp_find_own(bs, str(pick["url"]), hours=2)
+                    except Exception:  # noqa: BLE001
+                        uri = ""
+                if not uri:
+                    try:
+                        bridge("bp_fail", message=str(e)[:250])
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return {"status": "fehler", "grund": str(e)[:200]}
+            bridge("bp_done", post_id=int(pick["post_id"]), uri=uri, title=pick.get("title", ""), url=pick["url"], text=pick["text"])
+            return {"status": "posted", "uri": uri, "post_id": pick["post_id"], "zeichen": len(pick["text"])}
+        return {"status": "nichts zu tun"}
+    except Exception as e:  # noqa: BLE001
+        msg = str(e)
+        if "unknown_action" in msg:
+            return {"status": "Seite kennt bp_pick noch nicht (Bridge-Update fehlt)"}
+        return {"status": "fehler", "grund": msg[:200]}
+
+
 def main() -> int:
     global GEMINI_MODEL
     missing = [n for n, v in (("FL_BRIDGE_URL", BRIDGE_URL), ("FL_BRIDGE_SECRET", BRIDGE_SECRET), ("BSKY_HANDLE", BSKY_HANDLE), ("BSKY_APP_PASSWORD", BSKY_PW)) if not v]
@@ -1911,8 +2065,12 @@ def main() -> int:
             return {"status": "error", "message": str(e)[:200]}
         finally:
             timing["entfolger"] = round(time.monotonic() - t1, 1)
+    bp_res: dict = {"status": "nicht gelaufen"}
     try:
         bs = Bsky()
+        t1 = time.monotonic()
+        bp_res = bdsm_post(bs)                 # BDSMPOST-20261115: eigener Schritt, wirft nie, ändert nichts an den anderen
+        timing["bdsm_post"] = round(time.monotonic() - t1, 1)
         if uf_first:
             phase(likes_uf_end - 90)          # mind. 90 s bleiben für die Likes
             uf_res = do_uf()
@@ -1964,6 +2122,7 @@ def main() -> int:
         log("Hinweise (kein Fehler): " + "; ".join(af_stats["hints"]))
     if _AI["calls"]:
         log(f"KI: {_AI['calls']} Aufrufe, Ø {_AI['secs'] / _AI['calls']:.1f} s, {_AI['retries']} Wiederholungen, {AI_WORKERS} parallel")
+    log("BDSM-Tagespost: " + json.dumps(bp_res, ensure_ascii=False))
     log("Zeiten (s): " + json.dumps(timing, ensure_ascii=False) + (" | Abgleich zuerst" if uf_first else ""))
     log(f"Dauer {time.monotonic() - T0:.1f} s")
     return 0 if clean else 1
