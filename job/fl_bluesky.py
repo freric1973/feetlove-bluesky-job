@@ -8,6 +8,8 @@ KI-Check (xAI, inkl. echte_frage), Like-Limit je Lauf (Setting bluesky_autolike_
 Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), Limit je Lauf und Tag aus den Admin-Einstellungen, nicht schon gefolgt,
 nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; bis einschließlich Setting autofollow_reunfollowed_until (Standard 2027-02-14, Europe/Berlin) auch Liker mit reason „von dir entfolgt“; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
 Ab 2026-11-14 22:00 Europe/Berlin neue Entfolger-Warteschlangen-Zeilen nur bei Like oder vorhandener Post-URI; bestehende Zeilen vor diesem Stichtag (created_at, UTC) behalten das bisherige Verhalten.
+ENTFOLGER-LIKER-20261115: Frühere Entfolger bekommen den sichtbaren Grund AF_REASON_RETURN_LIKED nur, wenn ein Like
+(getLikes createdAt, sonst indexedAt) ab 2026-11-15 00:00 Europe/Berlin belegt ist; sonst bleibt der alte Grund (im Admin ausgeblendet).
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
@@ -1207,6 +1209,39 @@ def af_created_before_like_cutoff(created: str) -> bool:
     return dt < af_like_cutoff_utc()
 
 
+# Frühere Entfolger: sichtbar nur mit Like ab diesem Zeitpunkt.
+AF_RETURN_LIKE_SINCE = datetime(2026, 11, 15, 0, 0, tzinfo=ZoneInfo("Europe/Berlin"))
+AF_REASON_RETURN_WAIT = "Früherer Entfolger: wartet auf erneutes Folgen"
+AF_REASON_RETURN_LIKED = "Früherer Entfolger: hat seit 15.11. geliked, wartet auf erneutes Folgen"
+
+
+def af_parse_ts(raw: str) -> datetime | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})", raw)
+        if not m:
+            return None
+        try:
+            dt = datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def af_like_time(lk: dict) -> datetime | None:
+    return af_parse_ts(str((lk or {}).get("createdAt") or "")) or af_parse_ts(str((lk or {}).get("indexedAt") or ""))
+
+
+def af_liked_since_return_cutoff(ts: datetime | None) -> bool:
+    return ts is not None and ts >= AF_RETURN_LIKE_SINCE.astimezone(timezone.utc)
+
+
 def af_may_enqueue_return(did: str, likers: dict[str, str], created: dict[str, str], uris: dict[str, str], known: dict[str, str]) -> bool:
     if did in likers:
         return True
@@ -1341,6 +1376,7 @@ class AutoFollow:
                 st["followed_back_new"] = n
             # 2) Liker eigener Posts
             likers: dict[str, str] = {}
+            liked_recent: dict[str, str] = {}  # did -> Post-URI eines Likes ab AF_RETURN_LIKE_SINCE
             new_cache: dict = {}
             time_limit = False
             for p in af_own_posts(self.bs, self.days):
@@ -1379,6 +1415,8 @@ class AutoFollow:
                         did = str(actor.get("did") or "")
                         if did and did != self.bs.did and did not in likers:
                             likers[did] = uri
+                        if did and did != self.bs.did and did not in liked_recent and af_liked_since_return_cutoff(af_like_time(lk)):
+                            liked_recent[did] = uri
                     cursor = d.get("cursor")
                     pages += 1
                     if SLEEP_AF:
@@ -1415,6 +1453,10 @@ class AutoFollow:
                     batch = return_dids
                 batch = batch[:50]
                 returns: dict[str, str] = {}
+                # Frühere Entfolger mit Like ab AF_RETURN_LIKE_SINCE unabhängig vom Stapel prüfen.
+                for d in return_dids:
+                    if d in liked_recent:
+                        returns[d] = todo.get(d) or liked_recent[d]
                 for d in batch:
                     if d in todo:
                         returns[d] = todo[d]
@@ -1437,7 +1479,10 @@ class AutoFollow:
                     continue
                 v = p.get("viewer") or {}
                 if did in self.excluded and not v.get("followedBy"):
-                    self.add({"t": "mark_blocked", "did": did, "reason": "Früherer Entfolger: wartet auf erneutes Folgen"})
+                    if did in liked_recent:
+                        self.save(did, p, liked_recent[did], "blocked", AF_REASON_RETURN_LIKED)
+                    else:
+                        self.add({"t": "mark_blocked", "did": did, "reason": AF_REASON_RETURN_WAIT})
                     st["skipped"] += 1
                     continue
                 if v.get("following"):
