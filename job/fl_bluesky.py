@@ -1744,7 +1744,9 @@ class AutoFollow:
                         st["skipped"] += 1
                     continue
                 v = p.get("viewer") or {}
-                if did in self.excluded and not v.get("followedBy"):
+                # FOLGELISTE-FIX-20261119: Folgt dailyfun dem früheren Entfolger schon, nicht wieder als
+                # „wartet auf erneutes Folgen“ (blocked) speichern, sondern unten als „folgst bereits“ führen.
+                if did in self.excluded and not v.get("followedBy") and not v.get("following"):
                     if did in liked_recent:
                         self.save(did, p, liked_recent[did], "blocked", AF_REASON_RETURN_LIKED)
                     else:
