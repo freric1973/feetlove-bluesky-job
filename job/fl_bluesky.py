@@ -8,8 +8,12 @@ KI-Check (nur Gemini, inkl. echte_frage; xAI entfernt 15.11.2026), Like-Limit je
 Auto-Folgen: Liker eigener Posts der letzten N Tage (Standard 7), Limit je Lauf und Tag aus den Admin-Einstellungen, nicht schon gefolgt,
 nicht blockiert/stumm, keine Spam-Labels, keine Entfolger-Sperre; bis einschließlich Setting autofollow_reunfollowed_until (Standard 2027-02-14, Europe/Berlin) auch Liker mit reason „von dir entfolgt“; Eintrag in flb_bluesky_autofollow (reason automatisch, followed_at UTC).
 Ab 2026-11-14 22:00 Europe/Berlin neue Entfolger-Warteschlangen-Zeilen nur bei Like oder vorhandener Post-URI; bestehende Zeilen vor diesem Stichtag (created_at, UTC) behalten das bisherige Verhalten.
-ENTFOLGER-LIKER-20261115: Frühere Entfolger bekommen den sichtbaren Grund AF_REASON_RETURN_LIKED nur, wenn ein Like
-(getLikes createdAt, sonst indexedAt) ab 2026-11-15 00:00 Europe/Berlin belegt ist; sonst bleibt der alte Grund (im Admin ausgeblendet).
+ENTFOLGER-LIKER-20261115: Frühere Entfolger bekamen den sichtbaren Grund AF_REASON_RETURN_LIKED nur, wenn ein Like
+(getLikes createdAt, sonst indexedAt) ab 2026-11-15 00:00 Europe/Berlin belegt war; sonst blieb der alte Grund (ausgeblendet).
+ENTFOLGER-REGEL-20261120: Frühere Entfolger (wer Dennis/dailyfun entfolgt ist) erscheinen nicht mehr auf der Liste
+„Nicht automatisch gefolgt“ und werden nicht zurückgefolgt, auch nicht nach einem Like. Nur wenn das Konto Dennis
+selbst wieder folgt (viewer.followedBy), gilt normales Auto-Folgen. Status bleibt blocked (ENUM/Bridge-Whitelist);
+Grund AF_REASON_RETURN_IGNORED blendet das Widget aus.
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
 BDSMPOST-20261115: täglicher #BDSM-Textpost (Rubrik „Meine BDSM-Welt“, ab 23:30 Europe/Berlin, ohne Bild/Linkkarte, Kurzlink /b/<ID>, Standard AUS im Admin).
@@ -1300,6 +1304,7 @@ def af_created_before_like_cutoff(created: str) -> bool:
 AF_RETURN_LIKE_SINCE = datetime(2026, 11, 15, 0, 0, tzinfo=ZoneInfo("Europe/Berlin"))
 AF_REASON_RETURN_WAIT = "Früherer Entfolger: wartet auf erneutes Folgen"
 AF_REASON_RETURN_LIKED = "Früherer Entfolger: hat seit 15.11. geliked, wartet auf erneutes Folgen"
+AF_REASON_RETURN_IGNORED = "Früherer Entfolger: ignoriert, bis er wieder folgt"
 
 
 def af_parse_ts(raw: str) -> datetime | None:
@@ -1338,6 +1343,14 @@ def af_may_enqueue_return(did: str, likers: dict[str, str], created: dict[str, s
     if did not in known:
         return False
     return af_created_before_like_cutoff(created.get(did, ""))
+
+
+def af_ignore_former_unfollower(did: str, profile, excluded) -> bool:
+    """True: früherer Entfolger, folgt Dennis nicht, dailyfun folgt ihm nicht – nicht folgen, nicht auf die Liste."""
+    if did not in excluded:
+        return False
+    v = (profile or {}).get("viewer") or {}
+    return (not v.get("followedBy")) and (not v.get("following"))
 
 
 AF_REASON_DAY_LIMIT = "Tageslimit erreicht"
@@ -1612,6 +1625,15 @@ class AutoFollow:
         self.confirmed.add(did)
         self.vd[did] = int(time.time())
 
+    def stash_leftover(self, did: str, p: dict, src: str, leftover_reason: str, st: dict) -> None:
+        """Limit/Zeit: normale Liker als would_follow merken; frühere Entfolger ohne Rückfolge ausblenden."""
+        if af_ignore_former_unfollower(did, p, self.excluded):
+            self.save(did, p, src, "blocked", AF_REASON_RETURN_IGNORED)
+            st["skipped"] += 1
+        else:
+            self.save(did, p, src, "would_follow", leftover_reason)
+            st["would_follow"] += 1
+
     def run(self) -> dict:
         st = self.stats
         if not self.af.get("ready"):
@@ -1745,12 +1767,11 @@ class AutoFollow:
                     continue
                 v = p.get("viewer") or {}
                 # FOLGELISTE-FIX-20261119: Folgt dailyfun dem früheren Entfolger schon, nicht wieder als
-                # „wartet auf erneutes Folgen“ (blocked) speichern, sondern unten als „folgst bereits“ führen.
+                # Entfolger merken, sondern unten als „folgst bereits“ führen.
+                # ENTFOLGER-REGEL-20261120: sonst ignorieren (kein Auto-Folgen, nicht auf der Liste),
+                # bis das Konto selbst wieder folgt.
                 if did in self.excluded and not v.get("followedBy") and not v.get("following"):
-                    if did in liked_recent:
-                        self.save(did, p, liked_recent[did], "blocked", AF_REASON_RETURN_LIKED)
-                    else:
-                        self.add({"t": "mark_blocked", "did": did, "reason": AF_REASON_RETURN_WAIT})
+                    self.save(did, p, liked_recent.get(did) or src, "blocked", AF_REASON_RETURN_IGNORED)
                     st["skipped"] += 1
                     continue
                 if v.get("following"):
@@ -1784,30 +1805,26 @@ class AutoFollow:
                         st["limit_reached"] = True
                     else:
                         st["run_limit"] = True
-                    self.save(did, p, src, "would_follow", leftover_reason)
-                    st["would_follow"] += 1
+                    self.stash_leftover(did, p, src, leftover_reason, st)
                     # restliche ebenfalls merken, damit die Tageszahlen-Liste sie zeigt
                     idx = list(todo.keys()).index(did)
                     rest_all = list(todo.keys())[idx + 1:]
                     # ALLELIKES: Rückstand gedrosselt merken; Rest findet der nächste Lauf/die nächste Runde wieder
                     for rest_did in rest_all[:AF_QUEUE_MAX]:
                         rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
-                        self.save(rest_did, rp, todo[rest_did], "would_follow", leftover_reason)
-                        st["would_follow"] += 1
+                        self.stash_leftover(rest_did, rp, todo[rest_did], leftover_reason, st)
                     st["backlog"] = 1 + len(rest_all)
                     break
                 if left() < 8:
                     st["time_limit"] = True
                     leftover_reason = "Zeitbudget – nächster Lauf"
-                    self.save(did, p, src, "would_follow", leftover_reason)
-                    st["would_follow"] += 1
+                    self.stash_leftover(did, p, src, leftover_reason, st)
                     idx = list(todo.keys()).index(did)
                     rest_all = list(todo.keys())[idx + 1:]
                     # ALLELIKES: Rückstand gedrosselt merken; Rest findet der nächste Lauf/die nächste Runde wieder
                     for rest_did in rest_all[:AF_QUEUE_MAX]:
                         rp = profiles.get(rest_did) or {"handle": "", "displayName": ""}
-                        self.save(rest_did, rp, todo[rest_did], "would_follow", leftover_reason)
-                        st["would_follow"] += 1
+                        self.stash_leftover(rest_did, rp, todo[rest_did], leftover_reason, st)
                     st["backlog"] = 1 + len(rest_all)
                     break
                 try:
