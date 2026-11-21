@@ -15,6 +15,8 @@ ENTFOLGER-REGEL-20261120: Frühere Entfolger (wer Dennis/dailyfun entfolgt ist) 
 selbst wieder folgt (viewer.followedBy), gilt normales Auto-Folgen. Status bleibt blocked (ENUM/Bridge-Whitelist);
 Grund AF_REASON_RETURN_IGNORED blendet das Widget aus.
 Nur-Lesen folgt nicht und schreibt nichts. Blockierte und kurze Störungen sind Hinweise, keine Fehler.
+BLOCK-LISTEN-20261121: Bluesky-Blocks nie automatisch folgen und nicht in die would_follow-Warteschlange;
+status=blocked mit Grund-Präfix „Bluesky-Block:“ (ENUM unverändert).
 Datenbank-Zugriff nur über die geschützte Schnittstelle bluesky-gh-bridge.php (HMAC).
 BDSMPOST-20261115: täglicher #BDSM-Textpost (Rubrik „Meine BDSM-Welt“, ab 23:30 Europe/Berlin, ohne Bild/Linkkarte, Kurzlink /b/<ID>, Standard AUS im Admin).
 Nur Python-Standardbibliothek. Geheimnisse ausschließlich aus Umgebungsvariablen (GitHub Secrets).
@@ -1244,6 +1246,72 @@ def af_follow(bs: Bsky, did: str) -> str:
 AF_REUNFOLLOWED_UNTIL_DEFAULT = "2027-02-14"
 AF_REASON_SELF_UNFOLLOWED = "von dir entfolgt"
 
+# BLOCK-LISTEN-20261121
+AF_REASON_GRAPH_BLOCK_PREFIX = "Bluesky-Block:"
+AF_REASON_BLOCKED_BY = "Bluesky-Block: hat dich geblockt"
+AF_REASON_BLOCKING = "Bluesky-Block: von dir geblockt"
+AF_REASON_BLOCK_LIST = "Bluesky-Block: über eine Blockliste"
+AF_REASON_MUTED = "Bluesky-Block: stummgeschaltet"
+AF_REASON_BLOCK_FOLLOW_ERR = "Bluesky-Block: Folgen wegen Block abgelehnt"
+AF_REASON_BLOCK_LEGACY = "blockiert/stummgeschaltet"
+
+
+def af_is_graph_block_reason(reason: str) -> bool:
+    why = reason or ""
+    return why.startswith(AF_REASON_GRAPH_BLOCK_PREFIX) or why == AF_REASON_BLOCK_LEGACY or why.startswith("geblockt")
+
+
+def af_viewer_block_reason(viewer) -> str:
+    v = viewer or {}
+    if v.get("blockedBy"):
+        return AF_REASON_BLOCKED_BY
+    if v.get("blocking"):
+        return AF_REASON_BLOCKING
+    if v.get("blockingByList"):
+        return AF_REASON_BLOCK_LIST
+    if v.get("muted") or v.get("mutedByList"):
+        return AF_REASON_MUTED
+    return ""
+
+
+def af_flagged_block_reason(flag: str) -> str:
+    f = flag or ""
+    if not f:
+        return ""
+    if f.startswith(AF_REASON_GRAPH_BLOCK_PREFIX):
+        return f
+    if f == "geblockt" or f.startswith("geblockt"):
+        return AF_REASON_BLOCKING
+    return ""
+
+
+def af_graph_block_reason(did: str, profile=None, flagged=None) -> str:
+    viewer = (profile or {}).get("viewer") if isinstance(profile, dict) else {}
+    r = af_viewer_block_reason(viewer)
+    if r:
+        return r
+    r = af_flagged_block_reason((flagged or {}).get(did) or "")
+    if r:
+        return r
+    return ""
+
+
+def af_follow_block_error_reason(exc: BaseException) -> str:
+    err = ""
+    msg = str(exc)
+    body: dict = {}
+    if isinstance(exc, BskyHttpError):
+        err = exc.error or ""
+        body = exc.body or {}
+    blob = f"{err} {msg} {body}"
+    if re.search(r"BlockedByActor", blob, re.I):
+        return AF_REASON_BLOCKED_BY
+    if re.search(r"BlockedActor", blob, re.I):
+        return AF_REASON_BLOCKING
+    if re.search(r"\bblocked\b", blob, re.I):
+        return AF_REASON_BLOCK_FOLLOW_ERR
+    return ""
+
 
 def af_reunfollowed_until(raw=None) -> str:
     """Stichtag als YYYY-MM-DD; ungültige Werte fallen auf den Standard zurück."""
@@ -1630,9 +1698,14 @@ class AutoFollow:
         if af_ignore_former_unfollower(did, p, self.excluded):
             self.save(did, p, src, "blocked", AF_REASON_RETURN_IGNORED)
             st["skipped"] += 1
-        else:
-            self.save(did, p, src, "would_follow", leftover_reason)
-            st["would_follow"] += 1
+            return
+        br = af_graph_block_reason(did, p, self.flagged)
+        if br:
+            self.save(did, p, src, "blocked", br)
+            st["skipped"] += 1
+            return
+        self.save(did, p, src, "would_follow", leftover_reason)
+        st["would_follow"] += 1
 
     def run(self) -> dict:
         st = self.stats
@@ -1652,6 +1725,12 @@ class AutoFollow:
                 for did in self.recheck:
                     p = pp.get(did)
                     if not p:
+                        continue
+                    br = af_graph_block_reason(did, p, self.flagged)
+                    if br:
+                        self.add({"t": "mark_blocked", "did": did, "reason": br})
+                        self.known[did] = "blocked"
+                        st["blocked_new"] = st.get("blocked_new", 0) + 1
                         continue
                     if not (p.get("viewer") or {}).get("following"):
                         self.add({"t": "mark_blocked", "did": did, "reason": AF_REASON_SELF_UNFOLLOWED})
@@ -1779,10 +1858,11 @@ class AutoFollow:
                     self.confirm(did)
                     st["skipped"] += 1
                     continue
-                if v.get("blocking") or v.get("blockedBy") or v.get("muted"):
-                    self.save(did, p, src, "skipped", "blockiert/stummgeschaltet")
+                br = af_graph_block_reason(did, p, self.flagged)
+                if br:
+                    self.save(did, p, src, "blocked", br)
                     st["skipped"] += 1
-                    af_hint(st, "Auto-Folgen: blockiertes oder stummgeschaltetes Konto übersprungen (kein Fehler).")
+                    af_hint(st, "Auto-Folgen: geblocktes oder stummgeschaltetes Konto übersprungen (kein Fehler).")
                     continue
                 flag = self.flagged.get(did) or ""
                 if flag:
@@ -1834,6 +1914,12 @@ class AutoFollow:
                 except Exception as e:  # noqa: BLE001
                     if str(e) == "RATE_LIMIT":
                         raise RateLimit() from e
+                    br = af_follow_block_error_reason(e)
+                    if br:
+                        self.save(did, p, src, "blocked", br)
+                        st["skipped"] += 1
+                        af_hint(st, "Auto-Folgen: Folgen wegen Block abgelehnt (kein Fehler).")
+                        continue
                     af_err(st, str(e))
                     continue
                 if not fu:
