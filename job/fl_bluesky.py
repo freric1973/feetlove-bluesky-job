@@ -2150,6 +2150,7 @@ def main() -> int:
         log(f"Kein Lauf: {st.get('status')} {st.get('reason', '')}"); return 0
     GEMINI_MODEL = str(st.get("gemini_model") or "") or GEMINI_MODEL
     al_stats: dict = {"ok": True, "status": "disabled", "errors": []}; uf_res: dict = {"status": "skipped"}
+    pb_res: dict = {"status": "skipped"}
     af_stats: dict = {"ok": True, "status": "skipped", "errors": []}
     al = None; af = None; ran = False; af_ran = False
     timing: dict = {}
@@ -2195,6 +2196,14 @@ def main() -> int:
             except Exception as e:  # noqa: BLE001
                 af_stats = {"ok": False, "status": "error", "errors": [str(e)[:300]]}
             timing["auto_follow"] = round(time.monotonic() - t1, 1)
+        pb_res = {"status": "skipped"}
+        if not READONLY:
+            t1 = time.monotonic()
+            try:
+                pb_res = bridge("pb_tick", scan_lists=1, time_budget=20)
+            except Exception as e:  # noqa: BLE001
+                pb_res = {"ok": False, "status": "error", "message": str(e)[:200]}
+            timing["permanent_block"] = round(time.monotonic() - t1, 1)
     except Exception as e:  # noqa: BLE001
         al_stats = {"ok": False, "status": "error", "errors": [str(e)[:300]]}
     finally:
@@ -2228,6 +2237,7 @@ def main() -> int:
     if _AI["calls"]:
         log(f"KI: {_AI['calls']} Aufrufe, Ø {_AI['secs'] / _AI['calls']:.1f} s, {_AI['retries']} Wiederholungen, {AI_WORKERS} parallel")
     log("BDSM-Tagespost: " + json.dumps(bp_res, ensure_ascii=False))
+    log("Dauersperre/Zurückblocken: " + json.dumps(pb_res, ensure_ascii=False)[:500])
     log("Zeiten (s): " + json.dumps(timing, ensure_ascii=False) + (" | Abgleich zuerst" if uf_first else ""))
     log(f"Dauer {time.monotonic() - T0:.1f} s")
     return 0 if clean else 1
